@@ -1,0 +1,145 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+pytest-report.xml
+coverage.xml
+
+# Django
+*.log
+*.pot
+*.pyc
+__pycache__/
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+media
+
+# Static files (if using collectstatic)
+/static/
+/staticfiles/
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.env
+.venv
+pyvenv.cfg
+
+# Environment variables
+.env
+.env.local
+.env.development
+.env.production
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# Redis
+dump.rdb
+redis-data/
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Secret files that might accidentally be included
+*.pem
+*.key
+*.cert
+*.secret
+
+# Testing
+.coverage
+.pytest_cache/
+htmlcov/
+coverage.xml
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Django debug toolbar
+.djdt
+
+# Other
+.DS_Store
+Thumbs.db
+
+# PostgreSQL
+*.pgdump
+
+# Django project static files
+/static/
+/staticfiles/
+
+# Django media files
+/media/
+
+# Local development files
+localhosts
+/local/
+docker-compose.override.yml
+
+# mypy
+.mypy_cache/
+
+# deployment
+deploy/
+*.env.prod*
+
+# other
+*.bak
+*_bak
+*.tmp
+*~
+node_modules/ 

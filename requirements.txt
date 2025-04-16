@@ -1,0 +1,4 @@
+django
+anthropic
+psycopg2-binary
+redis 
