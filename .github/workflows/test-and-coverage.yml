@@ -35,10 +35,10 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-django coverage pytest-cov
       - name: Run tests with coverage
-        env:
-          DJANGO_SETTINGS_MODULE: db_chat_project.settings
         run: |
-          pytest --cov --cov-branch --cov-report=xml
+          coverage run -m pytest db_chat/tests
+          coverage report
+          coverage xml
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
