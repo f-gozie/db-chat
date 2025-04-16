@@ -50,11 +50,11 @@ A powerful, modular Django application that translates natural language question
    ```python
    # Choose your LLM provider
    LLM_PROVIDER = "anthropic"  # or "openai"
-   
+
    # API keys
    ANTHROPIC_API_KEY = "your_api_key_here"  # If using Anthropic
    OPENAI_API_KEY = "your_api_key_here"     # If using OpenAI
-   
+
    # Specify which models to expose to the chatbot
    ALLOWED_MODELS = [
        "users.User",
@@ -146,7 +146,7 @@ class NewProviderAdapter(LLMAdapter):
     def __init__(self):
         # Initialize client for the new provider
         pass
-        
+
     def generate_text(self, system_prompt, messages, max_tokens=1024):
         # Implement text generation using the new provider
         pass

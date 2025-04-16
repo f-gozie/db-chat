@@ -1,4 +1,7 @@
 django
 anthropic
 psycopg2-binary
-redis 
+redis
+pytest
+pytest-django
+coverage

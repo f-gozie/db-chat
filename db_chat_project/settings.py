@@ -10,8 +10,8 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.1/ref/settings/
 """
 
-from pathlib import Path
 import os
+from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -128,7 +128,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 ALLOWED_MODELS = []  # Specify models in "app_label.ModelName" format
 
 # LLM Configuration
-LLM_PROVIDER = "anthropic" # or "openai", "google", etc.
+LLM_PROVIDER = "anthropic"  # or "openai", "google", etc.
 ANTHROPIC_API_KEY = "YOUR_ANTHROPIC_API_KEY"
 # Add other LLM keys/configs as needed
 # OPENAI_API_KEY = "YOUR_OPENAI_API_KEY"
@@ -137,16 +137,18 @@ ANTHROPIC_API_KEY = "YOUR_ANTHROPIC_API_KEY"
 # Options:
 # - 'redis': Use Redis for conversation storage (requires 'redis' package)
 # - 'memory': Use in-memory storage (no persistence between restarts)
-CONVERSATION_STORAGE_TYPE = os.environ.get('CONVERSATION_STORAGE_TYPE', 'redis')
+CONVERSATION_STORAGE_TYPE = os.environ.get("CONVERSATION_STORAGE_TYPE", "redis")
 
 # Redis connection URL (only used if CONVERSATION_STORAGE_TYPE is 'redis')
 # Format: redis://username:password@host:port/db
-REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 # How long conversations should be kept (in seconds)
 # Default: 1 week (60 * 60 * 24 * 7)
-CONVERSATION_TTL_SECONDS = int(os.environ.get('CONVERSATION_TTL_SECONDS', 60 * 60 * 24 * 7))
+CONVERSATION_TTL_SECONDS = int(
+    os.environ.get("CONVERSATION_TTL_SECONDS", 60 * 60 * 24 * 7)
+)
 
 # Maximum number of previous messages to include in conversation context
 # Default: 10 messages
-CONVERSATION_CONTEXT_LIMIT = int(os.environ.get('CONVERSATION_CONTEXT_LIMIT', 10))
+CONVERSATION_CONTEXT_LIMIT = int(os.environ.get("CONVERSATION_CONTEXT_LIMIT", 10))

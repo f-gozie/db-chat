@@ -1,0 +1,9 @@
+[run]
+source = db_chat
+omit =
+    */tests/*
+    */migrations/*
+
+[report]
+show_missing = True
+skip_covered = True

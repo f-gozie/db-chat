@@ -1,12 +1,13 @@
 """Prompt templates for LLM interactions in the database chat app."""
 
+
 def get_sql_generation_system_prompt(schema, allowed_tables):
     """Return the system prompt for SQL generation.
-    
+
     Args:
         schema: Database schema information
         allowed_tables: List of allowed tables
-        
+
     Returns:
         str: Formatted system prompt
     """
@@ -31,10 +32,10 @@ Your goal is to generate precise SQL queries that retrieve ONLY the specific inf
 
 def get_sql_generation_user_prompt(user_query):
     """Return the user prompt for SQL generation.
-    
+
     Args:
         user_query: The user's original query
-        
+
     Returns:
         str: Formatted user prompt
     """
@@ -55,11 +56,11 @@ CRITICAL: Make sure your query is DIRECTLY relevant to my specific question. Don
 
 def get_interpretation_system_prompt(schema, user_query):
     """Return the system prompt for result interpretation.
-    
+
     Args:
         schema: Database schema information
         user_query: The user's original query
-        
+
     Returns:
         str: Formatted system prompt
     """
@@ -81,12 +82,12 @@ Your job is to answer THIS EXACT question based on the SQL results."""
 
 def get_interpretation_user_prompt(user_query, sql_query, raw_result):
     """Return the user prompt for result interpretation.
-    
+
     Args:
         user_query: The user's original query
         sql_query: The executed SQL query
         raw_result: The raw result from the SQL query
-        
+
     Returns:
         str: Formatted user prompt
     """
@@ -107,7 +108,7 @@ If the SQL result indicates an error, explain the issue briefly and suggest how 
 
 def get_error_system_prompt():
     """Return the system prompt for error explanation.
-    
+
     Returns:
         str: Formatted system prompt
     """
@@ -116,11 +117,11 @@ def get_error_system_prompt():
 
 def get_error_user_prompt(sql_query, error_message):
     """Return the user prompt for error explanation.
-    
+
     Args:
         sql_query: The SQL query that caused the error
         error_message: The error message from the database
-        
+
     Returns:
         str: Formatted user prompt
     """
@@ -132,4 +133,4 @@ def get_error_user_prompt(sql_query, error_message):
 But the query failed with this error:
 {error_message}
 
-Please explain the error in simple terms and suggest how I might rephrase my question to get a successful answer. Be brief and helpful, avoiding technical jargon when possible.""" 
+Please explain the error in simple terms and suggest how I might rephrase my question to get a successful answer. Be brief and helpful, avoiding technical jargon when possible."""
