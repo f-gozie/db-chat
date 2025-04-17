@@ -2,9 +2,12 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List
 
 from django.conf import settings
+from langchain_anthropic import ChatAnthropic
+from langchain_core import messages
+from langchain_openai import ChatOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -46,21 +49,46 @@ class LLMAdapter(ABC):
 
 
 class AnthropicAdapter(LLMAdapter):
-    """Adapter for Anthropic Claude models."""
+    """Adapter for Anthropic Claude models using LangChain."""
 
     def __init__(self):
-        """Initialize the Anthropic adapter."""
-        from anthropic import Anthropic
-
+        """Initialize the Anthropic LangChain adapter."""
         self.api_key = settings.ANTHROPIC_API_KEY
-        self.model = getattr(settings, "ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
-        self.client = Anthropic(api_key=self.api_key)
-        logger.info(f"Initialized Anthropic adapter with model: {self.model}")
+        self.model_name = getattr(
+            settings, "ANTHROPIC_MODEL", "claude-3-5-haiku-latest"
+        )
+        self.client = ChatAnthropic(
+            model=self.model_name,
+            anthropic_api_key=self.api_key,
+        )
+        logger.info(
+            f"Initialized LangChain Anthropic adapter with model: {self.model_name}"
+        )
+
+    def _convert_messages(
+        self, system_prompt: str, messages: List[Dict[str, str]]
+    ) -> List[messages.BaseMessage]:
+        """Converts messages to LangChain format, including system prompt."""
+        lc_messages: List[messages.BaseMessage] = [
+            messages.SystemMessage(content=system_prompt)
+        ]
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "user":
+                lc_messages.append(messages.HumanMessage(content=content))
+            elif role == "assistant":
+                lc_messages.append(messages.AIMessage(content=content))
+            # Langchain typically doesn't pass 'system' messages mid-conversation
+            # elif role == "system":
+            #     # Handle potential system messages if needed, though usually just one at the start
+            #     lc_messages.append(SystemMessage(content=content))
+        return lc_messages
 
     def generate_text(
         self, system_prompt: str, messages: List[Dict[str, str]], max_tokens: int = 1024
     ) -> str:
-        """Generate text using Anthropic's Claude.
+        """Generate text using LangChain's ChatAnthropic.
 
         Args:
             system_prompt: System prompt for Claude
@@ -70,41 +98,65 @@ class AnthropicAdapter(LLMAdapter):
         Returns:
             str: Generated text
         """
+        lc_messages = self._convert_messages(system_prompt, messages)
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                system=system_prompt,
-                messages=messages,
-                max_tokens=max_tokens,
-            )
-            return response.content[0].text.strip()
+            response = self.client.invoke(lc_messages, max_tokens=max_tokens)
+            if isinstance(response.content, str):
+                return response.content.strip()
+            else:
+                logger.warning(
+                    f"Received non-string content from Anthropic: {type(response.content)}"
+                )
+                return str(response.content).strip()
         except Exception as e:
-            logger.error(f"Error generating text with Anthropic: {e}")
+            logger.error(f"Error generating text with LangChain Anthropic: {e}")
             raise
 
 
 class OpenAIAdapter(LLMAdapter):
-    """Adapter for OpenAI models."""
+    """Adapter for OpenAI models using LangChain."""
 
     def __init__(self):
-        """Initialize the OpenAI adapter."""
+        """Initialize the OpenAI LangChain adapter."""
         try:
-            import openai
-
             self.api_key = settings.OPENAI_API_KEY
-            self.model = getattr(settings, "OPENAI_MODEL", "gpt-4o")
-            self.client = openai.OpenAI(api_key=self.api_key)
-            logger.info(f"Initialized OpenAI adapter with model: {self.model}")
+            self.model_name = getattr(settings, "OPENAI_MODEL", "gpt-4o")
+            self.client = ChatOpenAI(
+                model=self.model_name,
+                openai_api_key=self.api_key,
+            )
+            logger.info(
+                f"Initialized LangChain OpenAI adapter with model: {self.model_name}"
+            )
         except ImportError:
             logger.error(
-                "OpenAI package not installed. Please install with: pip install openai"
+                "OpenAI or LangChain OpenAI packages not installed. Please install with: pip install langchain-openai openai"
             )
             raise
+        except Exception as e:
+            logger.error(f"Error initializing LangChain OpenAI Adapter: {e}")
+            raise
+
+    def _convert_messages(
+        self, system_prompt: str, messages: List[Dict[str, str]]
+    ) -> List[messages.BaseMessage]:
+        """Converts messages to LangChain format, including system prompt."""
+        lc_messages: List[messages.BaseMessage] = [
+            messages.SystemMessage(content=system_prompt)
+        ]
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role == "user":
+                lc_messages.append(messages.HumanMessage(content=content))
+            elif role == "assistant":
+                lc_messages.append(messages.AIMessage(content=content))
+        return lc_messages
 
     def generate_text(
         self, system_prompt: str, messages: List[Dict[str, str]], max_tokens: int = 1024
     ) -> str:
-        """Generate text using OpenAI's models.
+        """Generate text using LangChain's ChatOpenAI.
 
         Args:
             system_prompt: System prompt for the model
@@ -114,14 +166,16 @@ class OpenAIAdapter(LLMAdapter):
         Returns:
             str: Generated text
         """
+        lc_messages = self._convert_messages(system_prompt, messages)
         try:
-            # Add system message to messages list (OpenAI format)
-            full_messages = [{"role": "system", "content": system_prompt}] + messages
-
-            response = self.client.chat.completions.create(
-                model=self.model, messages=full_messages, max_tokens=max_tokens
-            )
-            return response.choices[0].message.content.strip()
+            response = self.client.invoke(lc_messages, max_tokens=max_tokens)
+            if isinstance(response.content, str):
+                return response.content.strip()
+            else:
+                logger.warning(
+                    f"Received non-string content from OpenAI: {type(response.content)}"
+                )
+                return str(response.content).strip()
         except Exception as e:
-            logger.error(f"Error generating text with OpenAI: {e}")
+            logger.error(f"Error generating text with LangChain OpenAI: {e}")
             raise

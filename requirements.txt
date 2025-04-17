@@ -8,3 +8,10 @@ coverage
 daphne
 channels
 channels-redis
+
+# Langchain integration
+langchain>=0.3.23
+langchain-openai>=0.3.14
+langchain-anthropic>=0.3.12
+
+sqlparse

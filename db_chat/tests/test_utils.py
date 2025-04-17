@@ -98,3 +98,8 @@ class TestUtils:
         SELECT * FROM stats
         """
         assert not utils.is_safe_sql(invalid_cte_query, allowed)
+
+    def test_is_safe_sql_does_not_flag_column_in_expression(self):
+        allowed = ["projects_project"]
+        sql = "SELECT AVG(completion_rate) AS average_completion_rate FROM projects_project WHERE EXTRACT(YEAR FROM created) = 2023;"
+        assert utils.is_safe_sql(sql, allowed)

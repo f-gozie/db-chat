@@ -90,7 +90,7 @@ class ChatService:
             db_config = settings.DATABASES["default"]
             db_host = db_config.get("HOST", "postgres")
             db_port = db_config.get("PORT", "5432")
-            db_name = db_config.get("NAME", "eyemark_backend")
+            db_name = db_config.get("NAME", "db_chat")
             db_user = db_config.get("USER", "debug")
             db_password = db_config.get("PASSWORD", "debug")
 
