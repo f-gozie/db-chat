@@ -76,26 +76,49 @@ def is_safe_sql(text, allowed_tables):
         logger.warning(f"SQL contains write operations: {text}")
         return False
 
-    # Extract table names from the query
+    # Extract CTE names to exclude them from table validation
+    cte_names = []
+
+    # Handle WITH clause with multiple CTEs
+    if re.search(r"\bwith\b", text, re.IGNORECASE):
+        # Find all CTE definitions in the format "name AS (" including across multiple lines
+        cte_matches = re.findall(r"(\w+)\s+as\s*\(", text, re.IGNORECASE)
+        cte_names = [cte.lower() for cte in cte_matches]
+        logger.info(f"Found CTEs in query: {cte_names}")
+
+    # Extract table names from the main query and all subqueries
+    # This will find tables in FROM clauses (including subqueries)
     from_clauses = re.findall(
         r"\bfrom\s+(\w+)(?:\s+(?:as\s+)?(\w+))?", text, re.IGNORECASE
     )
+
+    # Find tables in JOIN clauses (including in subqueries)
     join_clauses = re.findall(
         r"\b(?:inner|left|right|outer|cross)?\s*join\s+(\w+)(?:\s+(?:as\s+)?(\w+))?",
         text,
         re.IGNORECASE,
     )
 
+    # Find tables in subqueries within WHERE, HAVING, or other clauses
+    subquery_clauses = re.findall(
+        r"\(\s*select\b.*?\bfrom\s+(\w+)(?:\s+(?:as\s+)?(\w+))?",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+
     # Combine all table references
     mentioned_tables = []
-    for match in from_clauses + join_clauses:
-        table_name = match[0]
-        mentioned_tables.append(table_name)
+    for match in from_clauses + join_clauses + subquery_clauses:
+        if isinstance(match, tuple) and len(match) > 0:
+            table_name = match[0]
+            mentioned_tables.append(table_name)
+        elif isinstance(match, str):
+            mentioned_tables.append(match)
 
-    # Check if all mentioned tables are in the allowed tables list
+    # Check if all mentioned tables are in the allowed tables list or are CTEs
     allowed_tables_lower = [t.lower() for t in allowed_tables]
     for table in mentioned_tables:
-        if table.lower() not in allowed_tables_lower:
+        if table.lower() not in allowed_tables_lower and table.lower() not in cte_names:
             logger.warning(f"SQL references non-allowed table: {table}")
             return False
 

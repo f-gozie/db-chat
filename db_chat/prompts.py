@@ -6,7 +6,7 @@ def get_sql_generation_system_prompt(schema, allowed_tables):
 
     Args:
         schema: Database schema information
-        allowed_tables: List of allowed tables
+        allowed_tables: List of allowed table names
 
     Returns:
         str: Formatted system prompt
@@ -26,6 +26,7 @@ IMPORTANT INSTRUCTIONS FOR HANDLING QUERIES:
 4. Always use exact string values from the CHOICES list, including spaces and special characters
 5. Pay attention to primary keys, foreign keys, and table relationships
 6. Query only tables listed in the schema - don't reference tables that aren't available
+7. You may use Common Table Expressions (CTEs) with WITH clauses to organize complex queries
 
 Your goal is to generate precise SQL queries that retrieve ONLY the specific information requested in the current question, with careful attention to field types, constraints, and exact CHOICE values."""
 

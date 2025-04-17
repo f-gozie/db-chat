@@ -524,13 +524,25 @@ class ChatService:
                 }
 
             if not is_safe_sql(sql_query, self.allowed_tables):
+                cte_debug_info = ""
+                if "with" in sql_query.lower():
+                    cte_matches = re.findall(
+                        r"(\w+)\s+as\s*\(", sql_query.lower(), re.IGNORECASE
+                    )
+                    cte_debug_info = f" Query contains CTEs: {', '.join(cte_matches)}."
+
                 error_message = "The generated query attempts to access data or use operations that are not permitted. Please focus your question on the allowed tables."
+
                 logger.warning(f"Generated SQL failed safety validation: {sql_query}")
+                logger.warning(f"Allowed tables: {', '.join(self.allowed_tables)}")
+                logger.warning(f"CTEs found: {cte_debug_info}")
+
                 self.save_message(conversation_id, "assistant", error_message)
                 return {
                     "reply": error_message,
                     "conversation_id": conversation_id,
                     "error": "security_violation",
+                    "sql_query": sql_query,
                 }
 
             if self._has_trailing_comma(sql_query):
@@ -539,7 +551,7 @@ class ChatService:
                 self.save_message(conversation_id, "assistant", error_message)
                 return {
                     "reply": error_message,
-                    "sql_query": sql_query,  # Include faulty query for context
+                    "sql_query": sql_query,
                     "raw_result": "Error: SQL query syntax error (trailing comma)",
                     "conversation_id": conversation_id,
                     "error": "trailing_comma",
@@ -627,21 +639,11 @@ class ChatService:
             user_prompt = prompts.get_interpretation_user_prompt(
                 user_query,
                 sql_query,
-                str(raw_result),  # Ensure result is stringified for prompt
+                str(raw_result),
             )
 
             messages_for_llm = interpretation_messages + [
-                # Add SQL/Result context as a system message before the interpretation request
-                # Note: This differs slightly from original; aiming for clarity for LLM.
-                # If issues arise, revert to putting SQL/result only in user_prompt.
-                {
-                    "role": "system",
-                    "content": f"Executed SQL:\n```sql\n{sql_query}\n```\nResult:\n```\n{raw_result}\n```",
-                },
-                {
-                    "role": "user",
-                    "content": "Based on the original question and the SQL execution details above, please provide a natural language explanation of the result.",
-                },
+                {"role": "user", "content": user_prompt}
             ]
 
             logger.info("Interpreting SQL results via LLM...")
