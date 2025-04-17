@@ -66,13 +66,13 @@ class AnthropicAdapter(LLMAdapter):
         )
 
     def _convert_messages(
-        self, system_prompt: str, messages: List[Dict[str, str]]
+        self, system_prompt: str, message_dicts: List[Dict[str, str]]
     ) -> List[messages.BaseMessage]:
         """Converts messages to LangChain format, including system prompt."""
         lc_messages: List[messages.BaseMessage] = [
             messages.SystemMessage(content=system_prompt)
         ]
-        for msg in messages:
+        for msg in message_dicts:
             role = msg.get("role")
             content = msg.get("content", "")
             if role == "user":
@@ -138,13 +138,13 @@ class OpenAIAdapter(LLMAdapter):
             raise
 
     def _convert_messages(
-        self, system_prompt: str, messages: List[Dict[str, str]]
+        self, system_prompt: str, message_dicts: List[Dict[str, str]]
     ) -> List[messages.BaseMessage]:
         """Converts messages to LangChain format, including system prompt."""
         lc_messages: List[messages.BaseMessage] = [
             messages.SystemMessage(content=system_prompt)
         ]
-        for msg in messages:
+        for msg in message_dicts:
             role = msg.get("role")
             content = msg.get("content", "")
             if role == "user":
