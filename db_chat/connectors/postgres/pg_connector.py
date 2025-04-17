@@ -3,6 +3,7 @@ import logging
 import psycopg2
 import psycopg2.extras
 
+from ...constants import DatabaseDialects
 from ..base import BaseConnector
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,10 @@ class PgConnector(BaseConnector):
         connection_string (str): The database connection string.
         conn (psycopg2.connection | None): The active database connection object,
                                           or None if not connected.
+        dialect (str): The dialect for this connector.
     """
+
+    dialect: str = DatabaseDialects.POSTGRESQL
 
     def __init__(self, connection_string: str):
         """Initializes the PgConnector.
@@ -47,13 +51,13 @@ class PgConnector(BaseConnector):
         try:
             logger.info(
                 f"Connecting to PostgreSQL using the provided connection string."
-            )  # Avoid logging the full string
+            )
             self.conn = psycopg2.connect(self.connection_string)
             logger.info("Successfully connected to PostgreSQL.")
             return True
         except Exception as e:
             logger.error(f"Failed to connect to PostgreSQL: {str(e)}")
-            self.conn = None  # Ensure conn is None on failure
+            self.conn = None
             return False
 
     def disconnect(self):
@@ -88,5 +92,5 @@ class PgConnector(BaseConnector):
                 "Connection is closed or not established. Attempting to reconnect."
             )
             if not self.connect():
-                return None  # Failed to reconnect
+                return None
         return self.conn

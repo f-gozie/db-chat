@@ -1,6 +1,5 @@
 """Core service for the database chat application."""
 
-import json
 import logging
 import re
 from datetime import datetime
@@ -11,6 +10,7 @@ from django.conf import settings
 from . import prompts
 from .connectors.postgres.pg_connector import PgConnector
 from .connectors.postgres.pg_handler import PgHandler
+from .constants import DatabaseDialects
 from .llm_adapter import LLMAdapter
 from .model_registry import get_registry
 from .storage import ConversationStorage, get_conversation_storage
@@ -50,6 +50,7 @@ class ChatService:
             to query, derived from the model registry.
         context_limit (int): The maximum number of past messages to include in the
             context provided to the LLM.
+        db_dialect (str): The database dialect (e.g., "PostgreSQL").
     """
 
     db_connector: PgConnector
@@ -58,6 +59,7 @@ class ChatService:
     conversation_storage: ConversationStorage
     allowed_tables: List[str]
     context_limit: int
+    db_dialect: str
 
     def __init__(self):
         """Initializes the ChatService by setting up all its dependent components.
@@ -101,7 +103,19 @@ class ChatService:
 
             self.db_connector = PgConnector(connection_string)
             self.db_handler = PgHandler(self.db_connector)
-            logger.info("Database components initialized.")
+
+            try:
+                self.db_dialect = self.db_connector.dialect
+            except AttributeError:
+                self.db_dialect = DatabaseDialects.SQL
+                logger.warning(
+                    f"Connector type {type(self.db_connector)} does not have a 'dialect' attribute. "
+                    f"Defaulting to '{self.db_dialect}'."
+                )
+
+            logger.info(
+                f"Database components initialized with dialect: {self.db_dialect}"
+            )
         except KeyError:
             logger.exception("Database 'default' configuration not found in settings.")
             raise
@@ -313,7 +327,6 @@ class ChatService:
 
         messages = []
         for msg in history:
-            # Exclude system messages (often used for internal SQL/result logging)
             if msg.get("role") != "system":
                 content = msg.get("content", "")
                 if not isinstance(content, str):
@@ -368,7 +381,6 @@ class ChatService:
             f"Handling user query: '{user_query[:50]}...' in conversation: {conversation_id}"
         )
 
-        # --- 1. Conversation Management ---
         if conversation_id is None:
             try:
                 conversation_id = self.create_conversation()
@@ -390,12 +402,9 @@ class ChatService:
                     logger.info(f"Using existing conversation: {conversation_id}")
             except Exception as e:
                 logger.exception(f"Error managing conversation {conversation_id}: {e}")
-                # Attempt to continue, but log the issue.
 
-        # --- 2. Save User Query ---
         self.save_message(conversation_id, "user", user_query)
 
-        # --- 3. Get Schema ---
         schema = self.get_db_schema()
         if isinstance(schema, str) and schema.startswith("Error:"):
             error_message = f"Sorry, I encountered an issue accessing the database structure needed to answer your question. {schema}"
@@ -406,12 +415,9 @@ class ChatService:
                 "error": "schema_error",
             }
 
-        # --- 4. Generate, Validate, and Execute SQL ---
         sql_result = self._generate_and_execute_sql(user_query, schema, conversation_id)
 
-        # --- 5. Process SQL Result (Interpret, Explain Error, or Handle Generation Failure) ---
         if "error" in sql_result and "reply" in sql_result:
-            # SQL generation/validation failed, error message already saved by _generate_and_execute_sql
             logger.warning(
                 f"SQL generation/validation failed with error: {sql_result.get('error')}"
             )
@@ -422,19 +428,16 @@ class ChatService:
             executed_sql = sql_result["sql_query"]
 
             if isinstance(raw_db_result, str) and raw_db_result.startswith("Error:"):
-                # SQL execution failed
                 logger.info(f"SQL execution resulted in an error: {raw_db_result}")
                 return self.handle_sql_error(
                     user_query, executed_sql, raw_db_result, conversation_id
                 )
             else:
-                # SQL execution succeeded
                 logger.info("SQL executed successfully, proceeding to interpretation.")
                 return self._interpret_sql_results(
                     user_query, executed_sql, raw_db_result, schema, conversation_id
                 )
         else:
-            # This case should ideally not be reached if _generate_and_execute_sql returns correctly
             logger.error(
                 "Internal inconsistency: _generate_and_execute_sql finished without error but missing expected keys."
             )
@@ -450,21 +453,15 @@ class ChatService:
         self, user_query: str, schema: str, conversation_id: str
     ) -> Dict[str, Any]:
         """
-        Attempts to generate SQL from a user query, validate it, and execute it.
+        Attempts to generate SQL from a user query, delegates validation, and executes it.
 
         This involves:
-        1. Building the LLM prompt with schema, allowed tables, history, and the user query.
-        2. Calling the LLM to generate the SQL query text.
-        3. Cleaning the generated text (removing markdown, extra characters).
-        4. Validating the cleaned SQL for:
-           - Explicit refusal ("cannot answer").
-           - Basic structural validity (e.g., starts with SELECT).
-           - Safety (uses allowed tables, avoids forbidden operations).
-           - Syntax errors (e.g., trailing commas).
-        5. If validation passes, appending a semicolon if needed.
-        6. Executing the validated query using `self.execute_sql_query()`.
-        7. Saving the *executed* SQL and its *raw* result (even if it's an error message
-           from the DB) to conversation history with role 'system' for internal context.
+        1. Building the LLM prompt with context.
+        2. Calling the LLM to generate SQL.
+        3. Cleaning the generated text.
+        4. Calling `_validate_generated_sql` for validation (refusal, structure, safety, syntax).
+        5. If validation passes, executing the query via `execute_sql_query()`.
+        6. Saving the executed SQL and raw result to history.
 
         Args:
             user_query (str): The user's natural language query.
@@ -473,18 +470,15 @@ class ChatService:
 
         Returns:
             Dict[str, Any]:
-            - On successful execution: Returns {'sql_query': str, 'raw_result': Any}
-              (Note: 'raw_result' could still be an error string from the DB handler).
-            - On validation failure or LLM refusal: Returns {'reply': str, 'conversation_id': str,
-              'error': str, possibly 'sql_query' and 'raw_result' for logging context}.
-            - On unexpected exception: Returns {'reply': str, 'conversation_id': str,
-              'error': 'generation_execution_exception'}.
+            - On successful execution: {'sql_query': str, 'raw_result': Any}.
+            - On validation failure or LLM refusal: An error dictionary from `_validate_generated_sql`.
+            - On unexpected exception during generation/execution: An error dictionary.
         """
         try:
             conversation_messages = self._build_messages_for_llm(conversation_id)
 
             system_prompt = prompts.get_sql_generation_system_prompt(
-                schema, self.allowed_tables
+                schema, self.allowed_tables, self.db_dialect
             )
             user_prompt = prompts.get_sql_generation_user_prompt(user_query)
 
@@ -501,78 +495,22 @@ class ChatService:
             sql_query = clean_sql_query(generated_text)
             logger.info(f"Cleaned SQL query: {sql_query[:100]}...")
 
-            # --- Validation Steps ---
-            if "cannot answer" in sql_query.lower():
-                logger.warning(f"LLM indicated it cannot answer query: {sql_query}")
-                self.save_message(conversation_id, "assistant", sql_query)
-                return {
-                    "reply": sql_query,
-                    "conversation_id": conversation_id,
-                    "error": "cannot_answer",
-                }
+            validation_error = self._validate_generated_sql(sql_query, conversation_id)
+            if validation_error:
+                return validation_error
 
-            if not is_valid_sql_structure(sql_query):
-                error_message = "I couldn't generate a query with the correct structure (e.g., must start with SELECT). Please try rephrasing."
-                logger.warning(
-                    f"Generated SQL failed structure validation: {sql_query}"
-                )
-                self.save_message(conversation_id, "assistant", error_message)
-                return {
-                    "reply": error_message,
-                    "conversation_id": conversation_id,
-                    "error": "invalid_structure",
-                }
-
-            if not is_safe_sql(sql_query, self.allowed_tables):
-                cte_debug_info = ""
-                if "with" in sql_query.lower():
-                    cte_matches = re.findall(
-                        r"(\w+)\s+as\s*\(", sql_query.lower(), re.IGNORECASE
-                    )
-                    cte_debug_info = f" Query contains CTEs: {', '.join(cte_matches)}."
-
-                error_message = "The generated query attempts to access data or use operations that are not permitted. Please focus your question on the allowed tables."
-
-                logger.warning(f"Generated SQL failed safety validation: {sql_query}")
-                logger.warning(f"Allowed tables: {', '.join(self.allowed_tables)}")
-                logger.warning(f"CTEs found: {cte_debug_info}")
-
-                self.save_message(conversation_id, "assistant", error_message)
-                return {
-                    "reply": error_message,
-                    "conversation_id": conversation_id,
-                    "error": "security_violation",
-                    "sql_query": sql_query,
-                }
-
-            if self._has_trailing_comma(sql_query):
-                error_message = "I seem to have generated a query with a syntax error (a trailing comma). Could you please rephrase your question?"
-                logger.warning(f"Generated SQL has trailing comma: {sql_query}")
-                self.save_message(conversation_id, "assistant", error_message)
-                return {
-                    "reply": error_message,
-                    "sql_query": sql_query,
-                    "raw_result": "Error: SQL query syntax error (trailing comma)",
-                    "conversation_id": conversation_id,
-                    "error": "trailing_comma",
-                }
-
-            # --- Execution Preparation ---
             if not sql_query.endswith(";"):
                 sql_query += ";"
 
-            # --- Execute Validated Query ---
             logger.info(f"Executing validated SQL query: {sql_query}")
             raw_result = self.execute_sql_query(sql_query)
 
-            # --- Save Context for Future Turns (Internal) ---
             self.save_message(
                 conversation_id,
                 "system",
                 f"Executed SQL: {sql_query}\nRaw Result: {raw_result}",
             )
 
-            # Return execution details (raw_result might be data or an error string from DB)
             return {"sql_query": sql_query, "raw_result": raw_result}
 
         except Exception as e:
@@ -586,6 +524,84 @@ class ChatService:
                 "conversation_id": conversation_id,
                 "error": "generation_execution_exception",
             }
+
+    def _validate_generated_sql(
+        self, sql_query: str, conversation_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Validates the generated SQL query for safety, structure, and common errors.
+
+        Checks for:
+        - Explicit refusal ("cannot answer").
+        - Basic structural validity (e.g., starts with SELECT).
+        - Safety (uses allowed tables, avoids forbidden operations).
+        - Syntax errors (e.g., trailing commas).
+
+        If validation fails, the error message is saved to the conversation history.
+
+        Args:
+            sql_query (str): The cleaned SQL query generated by the LLM.
+            conversation_id (str): The ID of the current conversation for saving error messages.
+
+        Returns:
+            Optional[Dict[str, Any]]: An error dictionary if validation fails, suitable for
+                                      returning directly from the calling method. Returns None
+                                      if the query is valid.
+        """
+        if "cannot answer" in sql_query.lower():
+            logger.warning(f"LLM indicated it cannot answer query: {sql_query}")
+            self.save_message(conversation_id, "assistant", sql_query)
+            return {
+                "reply": sql_query,
+                "conversation_id": conversation_id,
+                "error": "cannot_answer",
+            }
+
+        if not is_valid_sql_structure(sql_query):
+            error_message = "I couldn't generate a query with the correct structure (e.g., must start with SELECT). Please try rephrasing."
+            logger.warning(f"Generated SQL failed structure validation: {sql_query}")
+            self.save_message(conversation_id, "assistant", error_message)
+            return {
+                "reply": error_message,
+                "conversation_id": conversation_id,
+                "error": "invalid_structure",
+            }
+
+        if not is_safe_sql(sql_query, self.allowed_tables):
+            cte_debug_info = ""
+            if "with" in sql_query.lower():
+                cte_matches = re.findall(
+                    r"(\w+)\s+as\s*\(", sql_query.lower(), re.IGNORECASE
+                )
+                if cte_matches:
+                    cte_debug_info = f" Query contains CTEs: {', '.join(cte_matches)}."
+
+            error_message = "The generated query attempts to access data or use operations that are not permitted. Please focus your question on the allowed tables."
+            logger.warning(f"Generated SQL failed safety validation: {sql_query}")
+            logger.warning(f"Allowed tables: {', '.join(self.allowed_tables)}")
+            if cte_debug_info:
+                logger.warning(f"CTEs found: {cte_debug_info}")
+
+            self.save_message(conversation_id, "assistant", error_message)
+            return {
+                "reply": error_message,
+                "conversation_id": conversation_id,
+                "error": "security_violation",
+                "sql_query": sql_query,
+            }
+
+        if self._has_trailing_comma(sql_query):
+            error_message = "I seem to have generated a query with a syntax error (a trailing comma). Could you please rephrase your question?"
+            logger.warning(f"Generated SQL has trailing comma: {sql_query}")
+            self.save_message(conversation_id, "assistant", error_message)
+            return {
+                "reply": error_message,
+                "sql_query": sql_query,
+                "raw_result": "Error: SQL query syntax error (trailing comma)",
+                "conversation_id": conversation_id,
+                "error": "trailing_comma",
+            }
+
+        return None
 
     def _has_trailing_comma(self, sql_query: str) -> bool:
         """Checks for a comma immediately preceding a closing parenthesis or semicolon
@@ -631,11 +647,9 @@ class ChatService:
                 - 'error' (Optional[str]): 'interpretation_exception' if LLM call fails.
         """
         try:
-            # Build context, including the latest user query implicitly via history
             interpretation_messages = self._build_messages_for_llm(conversation_id)
 
             system_prompt = prompts.get_interpretation_system_prompt(schema, user_query)
-            # Provide the executed SQL and its result explicitly in the user prompt
             user_prompt = prompts.get_interpretation_user_prompt(
                 user_query,
                 sql_query,
@@ -652,7 +666,6 @@ class ChatService:
             )
             logger.info("LLM interpretation received.")
 
-            # Save the final natural language response from the assistant
             self.save_message(conversation_id, "assistant", nl_response)
 
             return {
@@ -664,7 +677,6 @@ class ChatService:
 
         except Exception as e:
             logger.exception(f"Error interpreting SQL results: {e}")
-            # Fallback: Provide the raw result if interpretation fails
             error_message = (
                 f"I was able to retrieve the data, but encountered an issue while trying to explain it."
                 f"\n\nExecuted SQL:\n```sql\n{sql_query}\n```\nRaw result:\n```\n{raw_result}\n```"
@@ -719,20 +731,18 @@ class ChatService:
             )
             logger.info("LLM error explanation received.")
 
-            # Save the friendly error explanation as the assistant's response
             self.save_message(conversation_id, "assistant", friendly_error)
 
             return {
                 "reply": friendly_error,
                 "sql_query": sql_query,
-                "raw_result": error_message,  # The original DB error is the 'raw result' here
+                "raw_result": error_message,
                 "conversation_id": conversation_id,
                 "error": "sql_execution_error",
             }
 
         except Exception as e:
             logger.exception(f"Error generating SQL error explanation: {e}")
-            # Fallback: Just return the original technical error if explanation fails
             fallback_error_message = f"I encountered an error trying to execute the query.\n\nDetails: {error_message}"
             self.save_message(conversation_id, "assistant", fallback_error_message)
             return {
@@ -740,5 +750,5 @@ class ChatService:
                 "sql_query": sql_query,
                 "raw_result": error_message,
                 "conversation_id": conversation_id,
-                "error": "error_explanation_exception",  # Indicate the explanation step failed
+                "error": "error_explanation_exception",
             }

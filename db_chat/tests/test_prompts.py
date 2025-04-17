@@ -1,12 +1,15 @@
 import pytest
 
 import db_chat.prompts as prompts
+from db_chat.constants import DatabaseDialects
 
 
 def test_get_sql_generation_system_prompt():
     schema = "table info"
     allowed = ["users", "projects"]
-    result = prompts.get_sql_generation_system_prompt(schema, allowed)
+    result = prompts.get_sql_generation_system_prompt(
+        schema, allowed, DatabaseDialects.POSTGRESQL
+    )
     assert "table info" in result
     assert "users" in result and "projects" in result
 

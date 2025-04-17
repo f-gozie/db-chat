@@ -8,28 +8,20 @@ from db_chat.connectors.postgres.pg_handler import PgHandler
 # Mock the connector methods used by the handler
 @patch("db_chat.connectors.postgres.pg_connector.PgConnector.get_connection")
 class TestPgHandler:
-
-    # Test connect/disconnect implicitly via handler needing connection
-    # A dedicated PgConnector test suite could be added for more direct tests
-
     def test_execute_query_success(self, mock_get_connection):
         """Test successful query execution via the handler."""
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_get_connection.return_value = mock_conn
-        mock_conn.cursor.return_value.__enter__.return_value = (
-            mock_cursor  # Mock context manager
-        )
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
         mock_cursor.description = [
             ("id",),
             ("name",),
-        ]  # Need column names for formatting
+        ]
         mock_cursor.fetchall.return_value = [{"id": 1, "name": "test"}]
         mock_cursor.execute.side_effect = [None, None, None]  # BEGIN, SELECT, COMMIT
 
-        connector = PgConnector(
-            "fake_conn_str"
-        )  # We mock get_connection, so str is dummy
+        connector = PgConnector("fake_conn_str")
         handler = PgHandler(connector)
 
         result = handler.execute_query("SELECT * FROM test")
@@ -48,8 +40,8 @@ class TestPgHandler:
         mock_cursor = MagicMock()
         mock_get_connection.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-        mock_cursor.description = None  # No description means no results
-        mock_cursor.execute.side_effect = [None, None, None]  # BEGIN, SELECT, COMMIT
+        mock_cursor.description = None
+        mock_cursor.execute.side_effect = [None, None, None]
 
         connector = PgConnector("fake_conn_str")
         handler = PgHandler(connector)
@@ -63,7 +55,7 @@ class TestPgHandler:
 
     def test_execute_query_connection_error(self, mock_get_connection):
         """Test query execution when connection fails."""
-        mock_get_connection.return_value = None  # Simulate connection failure
+        mock_get_connection.return_value = None
 
         connector = PgConnector("fake_conn_str")
         handler = PgHandler(connector)
@@ -83,27 +75,25 @@ class TestPgHandler:
             None,
             Exception("bad sql"),
             None,
-        ]  # Error on SELECT
+        ]
 
         connector = PgConnector("fake_conn_str")
         handler = PgHandler(connector)
 
         result = handler.execute_query("SELECT invalid stuff")
 
-        assert "Error executing SQL query: bad sql" in result
+        assert "Error: SQL execution failed - bad sql" in result
 
     @patch("db_chat.connectors.postgres.pg_handler.get_registry")
     def test_get_schema_success_with_registry(
         self, mock_get_registry, mock_get_connection
     ):
         """Test get_schema successfully using model registry and DB fallback."""
-        # Mock connection and cursor for DB part
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_get_connection.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
 
-        # Mock registry
         mock_registry_instance = MagicMock()
         mock_get_registry.return_value = mock_registry_instance
         mock_registry_instance.get_table_schema.side_effect = (
@@ -112,7 +102,6 @@ class TestPgHandler:
             else None
         )
 
-        # Mock DB query results for the table not in registry
         table_not_in_registry = "table_from_db"
         mock_cursor.execute.side_effect = [
             # Columns query for table_from_db
@@ -141,7 +130,6 @@ class TestPgHandler:
         mock_get_registry.assert_called_once()
         assert mock_registry_instance.get_table_schema.call_count == 2
         assert "Schema for table_from_registry from Registry" in result
-        # Check if DB schema part is present and looks reasonable
         assert f"Table: {table_not_in_registry} (Primary Keys: id)" in result
         assert "- id: integer NOT NULL" in result
         assert "- name: text NULL" in result
@@ -176,7 +164,6 @@ class TestPgHandler:
         assert f"Table: {table_name} (Primary Keys: col1)" in result
         assert "- col1: varchar NOT NULL" in result
         assert "Error" not in result
-        # Ensure registry wasn't actually called successfully
         mock_get_registry_import_error.assert_called_once()
 
     def test_get_schema_db_error(self, mock_get_connection):
@@ -186,13 +173,11 @@ class TestPgHandler:
         mock_get_connection.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
 
-        # Simulate error during column fetch
         mock_cursor.execute.side_effect = Exception("db schema fetch failed")
 
         connector = PgConnector("fake_conn_str")
         handler = PgHandler(connector)
 
-        # Assume registry doesn't find it, forcing DB lookup
         with patch(
             "db_chat.connectors.postgres.pg_handler.get_registry"
         ) as mock_get_reg:

@@ -41,24 +41,40 @@ class PgHandler(BaseHandler):
         if not conn:
             return "Error: Failed to get database connection"
 
+        final_sql = sql_query
+        final_params = params or ()
+
+        # Escape literal % signs if no parameters are provided, to avoid psycopg2 misinterpretation
+        if not final_params:
+            final_sql = sql_query.replace("%", "%%")
+
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
                 cursor.execute("BEGIN TRANSACTION READ ONLY")
-                cursor.execute(sql_query, params or ())
+                cursor.execute(final_sql, final_params)
 
                 if cursor.description:
-                    result_list = cursor.fetchall()
-                    formatted_result = self._format_results(result_list)
-                    cursor.execute("COMMIT")
-                    return formatted_result
+                    try:
+                        result_list = cursor.fetchall()
+                        formatted_result = self._format_results(result_list)
+                        logger.debug(f"Formatted response: {formatted_result}")
+                        cursor.execute("COMMIT")
+                        return formatted_result
+                    except Exception as fetch_err:
+                        logger.error(
+                            f"Error during fetchall() or formatting: {fetch_err}, cursor.description: {getattr(cursor, 'description', None)}"
+                        )
+                        return (
+                            f"Error: Failed to process query results - {str(fetch_err)}"
+                        )
                 else:
-                    # Handle commands like SET that don't return rows but are valid
                     return "Query executed successfully, but it did not return any results."
 
         except Exception as e:
-            error_message = f"Error executing SQL query: {str(e)}"
-            logger.error(error_message)
-            return error_message
+            logger.error(
+                f"Error executing SQL query: {e}, Original SQL: {sql_query}, Params: {params}"
+            )
+            return f"Error: SQL execution failed - {str(e)}"
 
     def get_schema(self, tables=None):
         """Fetch and format schema information for specified tables.
@@ -85,7 +101,7 @@ class PgHandler(BaseHandler):
         try:
             registry = get_registry()
             model_schema_info = []
-            db_schema_tables = []  # Tables requiring direct DB inspection
+            db_schema_tables = []
 
             for table in tables:
                 model_schema = registry.get_table_schema(table)
@@ -99,7 +115,7 @@ class PgHandler(BaseHandler):
                 db_schema_info = self._get_db_schema(db_schema_tables)
                 if db_schema_info and not db_schema_info.startswith("Error:"):
                     db_schema_info_str = db_schema_info
-                elif db_schema_info:  # Propagate error from _get_db_schema
+                elif db_schema_info:
                     return db_schema_info
 
             all_schema_parts = model_schema_info
@@ -115,7 +131,6 @@ class PgHandler(BaseHandler):
             logger.info(
                 "Model registry not available, falling back to DB schema retrieval."
             )
-            # Fallback to direct DB inspection only if registry fails
             return self._get_db_schema(tables)
         except Exception as e:
             logger.error(f"Error fetching schema: {e}")
@@ -142,7 +157,7 @@ class PgHandler(BaseHandler):
 
         schema_info = []
         try:
-            with conn.cursor() as cursor:  # Use standard cursor for schema info
+            with conn.cursor() as cursor:
                 for table in tables:
                     cursor.execute(queries.GET_COLUMNS_QUERY, (table,))
                     columns = cursor.fetchall()
@@ -169,14 +184,9 @@ class PgHandler(BaseHandler):
                         table, pks, columns, fk_dict, choice_fields
                     )
                     schema_info.append(table_schema_str)
-
-            # Cursor and transaction are managed by the 'with' statement. Read-only, no commit needed.
-
         except Exception as e:
             logger.error(f"Error fetching schema directly from database: {e}")
-            # Rollback is not explicitly needed for read errors or managed by 'with' block.
             return f"Error fetching schema from database: {str(e)}"
-        # Connection management is handled by the connector, not closed here.
 
         if not schema_info:
             return "No schema information could be retrieved from the database for the specified tables."

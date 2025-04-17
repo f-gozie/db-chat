@@ -85,13 +85,22 @@ class ConversationStorage(ABC):
         """
         pass
 
+    @abstractmethod
+    def conversation_exists(self, conversation_id: str) -> bool:
+        """Check if a conversation exists.
+
+        Args:
+            conversation_id: The unique identifier for the conversation
+        """
+        pass
+
 
 class RedisConversationStorage(ConversationStorage):
     """Redis-based implementation of conversation storage."""
 
     def __init__(
         self, redis_url: Optional[str] = None, ttl_seconds: int = 60 * 60 * 24 * 7
-    ):  # 1 week default
+    ):
         """Initialize Redis connection.
 
         Args:
@@ -112,7 +121,7 @@ class RedisConversationStorage(ConversationStorage):
 
         try:
             self.redis_client = redis.Redis.from_url(self.redis_url)
-            self.redis_client.ping()  # Test connection
+            self.redis_client.ping()
             logger.info(f"Connected to Redis at {self.redis_url}")
         except Exception as e:
             logger.warning(f"Failed to connect to Redis at {self.redis_url}: {e}")
@@ -130,20 +139,13 @@ class RedisConversationStorage(ConversationStorage):
             return False
 
         try:
-            # Ensure message has a timestamp if not provided
             if "timestamp" not in message:
                 message["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-            # Serialize the message
             message_json = json.dumps(message)
-
-            # Get the conversation key
             conversation_key = self._get_conversation_key(conversation_id)
 
-            # Add message to the list
             self.redis_client.rpush(conversation_key, message_json)
-
-            # Set or refresh expiry
             self.redis_client.expire(conversation_key, self.ttl_seconds)
 
             return True
@@ -162,17 +164,12 @@ class RedisConversationStorage(ConversationStorage):
         try:
             conversation_key = self._get_conversation_key(conversation_id)
 
-            # Check if conversation exists
-            if not self.redis_client.exists(conversation_key):
+            if not self.conversation_exists(conversation_id):
                 return []
 
-            # Get all messages
             messages_json = self.redis_client.lrange(conversation_key, 0, -1)
-
-            # Parse messages
             messages = [json.loads(msg) for msg in messages_json]
 
-            # Apply limit if specified
             if limit is not None and limit > 0:
                 messages = messages[-limit:]
 
@@ -197,16 +194,12 @@ class RedisConversationStorage(ConversationStorage):
 
     def create_conversation(self) -> str:
         """Create a new conversation in Redis."""
-        # Generate a unique ID
         conversation_id = str(uuid.uuid4())
 
-        # Create a key in Redis that will expire
         if self.redis_client:
             try:
                 conversation_key = self._get_conversation_key(conversation_id)
-                # Set an empty string as value with expiry
                 self.redis_client.set(conversation_key, "", ex=self.ttl_seconds)
-                # Delete it right away - we just want the key to exist temporarily
                 self.redis_client.delete(conversation_key)
             except Exception as e:
                 logger.error(f"Error creating conversation in Redis: {e}")
@@ -226,9 +219,7 @@ class RedisConversationStorage(ConversationStorage):
         try:
             conversation_key = self._get_conversation_key(conversation_id)
 
-            # Check if conversation exists
-            if self.redis_client.exists(conversation_key):
-                # Update expiry
+            if self.conversation_exists(conversation_id):
                 self.redis_client.expire(conversation_key, ttl)
                 return True
             else:
@@ -240,6 +231,16 @@ class RedisConversationStorage(ConversationStorage):
         except Exception as e:
             logger.error(f"Error updating conversation expiry in Redis: {e}")
             return False
+
+    def conversation_exists(self, conversation_id: str) -> bool:
+        """Check if a conversation exists in Redis."""
+        if not self.redis_client:
+            logger.debug(
+                "Redis client not available, cannot check conversation existence"
+            )
+            return False
+
+        return self.redis_client.exists(self._get_conversation_key(conversation_id))
 
 
 class InMemoryConversationStorage(ConversationStorage):
@@ -266,15 +267,12 @@ class InMemoryConversationStorage(ConversationStorage):
     def save_message(self, conversation_id: str, message: Dict[str, Any]) -> bool:
         """Save a message to the conversation history in memory."""
         try:
-            # Ensure message has a timestamp if not provided
             if "timestamp" not in message:
                 message["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-            # Ensure conversation exists
             if conversation_id not in self._conversations:
                 self._conversations[conversation_id] = []
 
-            # Add message to the list
             self._conversations[conversation_id].append(message)
 
             return True
@@ -292,7 +290,6 @@ class InMemoryConversationStorage(ConversationStorage):
 
             messages = self._conversations[conversation_id]
 
-            # Apply limit if specified
             if limit is not None and limit > 0:
                 messages = messages[-limit:]
 
@@ -326,6 +323,10 @@ class InMemoryConversationStorage(ConversationStorage):
         """
         return conversation_id in self._conversations
 
+    def conversation_exists(self, conversation_id: str) -> bool:
+        """Check if a conversation exists in memory."""
+        return conversation_id in self._conversations
+
 
 # Factory function to get the configured storage implementation
 @lru_cache(maxsize=1)
@@ -352,7 +353,6 @@ def get_conversation_storage() -> ConversationStorage:
 
         storage = RedisConversationStorage(redis_url=redis_url, ttl_seconds=ttl_seconds)
 
-        # If Redis connection failed, fall back to in-memory
         if not storage.redis_client:
             logger.warning(
                 "Failed to connect to Redis, falling back to in-memory storage"

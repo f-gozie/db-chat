@@ -1,5 +1,6 @@
 """Module to extract schema information from Django models for the database chat application."""
 
+import json
 import logging
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -176,6 +177,14 @@ class ModelRegistry:
                 )
         return None
 
+    def _get_choices_and_related_model(self, field):
+        """Return a tuple (choices, related_model) for the given field."""
+        choices = self._get_choices(field)
+        related_model = None
+        if isinstance(field, related.RelatedField):
+            related_model = getattr(field, "related_model", None)
+        return (choices, related_model)
+
     def _extract_constraints(self, model) -> List[Dict[str, Any]]:
         """Extract model constraints."""
         constraints = []
@@ -203,12 +212,19 @@ class ModelRegistry:
             f"Table: {table_name} (Django Model: {model_info['app_label']}.{model_info['model_name']})\n"
         ]
 
-        # Add fields
         for field_name, field_info in model_info["fields"].items():
-            # Format field type
             field_type = field_info["field_type"]
+            db_column_name = field_info["column_name"]
 
-            # Format constraints
+            # Add specific PostgreSQL querying info for JSONField
+            json_info = ""
+            if field_type == "JSONField":
+                json_info = (
+                    f" (JSON object. Query keys in PostgreSQL: "
+                    f"(\"{db_column_name}\" ->> 'key_name')::datatype, "
+                    f"check key exists: \"{db_column_name}\" ? 'key_name')"
+                )
+
             constraints = []
             if field_info["is_primary_key"]:
                 constraints.append("PRIMARY KEY")
@@ -216,22 +232,49 @@ class ModelRegistry:
                 constraints.append("UNIQUE")
             if not field_info["is_null"]:
                 constraints.append("NOT NULL")
-            if field_info["default"] is not None:
-                constraints.append(f"DEFAULT {field_info['default']}")
+
+            default_val = field_info["default"]
+            if (
+                default_val is not None
+                and default_val != models.fields.NOT_PROVIDED
+                and default_val != ""
+            ):
+                default_str = (
+                    json.dumps(default_val)
+                    if isinstance(default_val, dict)
+                    else repr(default_val)
+                )
+                constraints.append(f"DEFAULT {default_str}")
+
             if field_info["related_model"]:
-                constraints.append(f"REFERENCES {field_info['related_model']}")
+                # Basic assumption: related model string format is AppLabel.ModelName
+                # This might need adjustment based on actual _get_related_model output
+                related_parts = field_info["related_model"].split(".")
+                if len(related_parts) == 2:
+                    try:
+                        related_model_ref = apps.get_model(
+                            related_parts[0], related_parts[1]
+                        )
+                        related_table = related_model_ref._meta.db_table
+                        related_pk = related_model_ref._meta.pk.name
+                        constraints.append(f"REFERENCES {related_table}({related_pk})")
+                    except LookupError:
+                        constraints.append(
+                            f"REFERENCES {field_info['related_model']} (unknown PK)"
+                        )  # Fallback
+                else:
+                    constraints.append(
+                        f"REFERENCES {field_info['related_model']} (unknown PK)"
+                    )
 
             constraints_str = " ".join(constraints)
 
-            # Format choices if present
             choices_str = ""
             if field_info["choices"]:
-                # Extract the actual values (not the display names)
-                choice_values = [str(choice[0]) for choice in field_info["choices"]]
-                choices_str = f" CHOICES: {', '.join(choice_values)}"
+                choice_values = [repr(choice[0]) for choice in field_info["choices"]]
+                choices_str = f" CHOICES: ({', '.join(choice_values)})"
 
-            # Build the complete field definition
-            field_def = f"  - {field_name} ({field_info['column_name']}): {field_type} {constraints_str}{choices_str}"
+            field_def = f"  - {field_name} ({db_column_name}): {field_type}{json_info} {constraints_str}{choices_str}"
             schema_lines.append(field_def)
 
         return "\n".join(schema_lines)

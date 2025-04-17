@@ -1,17 +1,26 @@
 """Prompt templates for LLM interactions in the database chat app."""
 
+import logging
 
-def get_sql_generation_system_prompt(schema, allowed_tables):
+from .helpers import get_dialect_syntax_example
+
+logger = logging.getLogger(__name__)
+
+
+def get_sql_generation_system_prompt(schema, allowed_tables, db_dialect: str):
     """Return the system prompt for SQL generation.
 
     Args:
         schema: Database schema information
         allowed_tables: List of allowed table names
+        db_dialect: The specific SQL dialect (e.g., 'PostgreSQL', 'MySQL').
 
     Returns:
         str: Formatted system prompt
     """
-    return f"""You are a database assistant connected to a PostgreSQL database.
+    syntax_example = get_dialect_syntax_example(db_dialect)
+
+    return f"""You are a database assistant connected to a {db_dialect} database.
 You can only execute read-only SQL queries.
 
 Here is the schema for the tables you have access to:
@@ -27,6 +36,7 @@ IMPORTANT INSTRUCTIONS FOR HANDLING QUERIES:
 5. Pay attention to primary keys, foreign keys, and table relationships
 6. Query only tables listed in the schema - don't reference tables that aren't available
 7. You may use Common Table Expressions (CTEs) with WITH clauses to organize complex queries
+8. CRITICAL: Ensure all SQL syntax, especially functions (like date/time functions), is compatible with {db_dialect}. {syntax_example}
 
 Your goal is to generate precise SQL queries that retrieve ONLY the specific information requested in the current question, with careful attention to field types, constraints, and exact CHOICE values."""
 
