@@ -1,7 +1,6 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-from django.conf import settings
 
 from db_chat.constants import DatabaseDialects
 from db_chat.services import ChatService
@@ -396,3 +395,123 @@ class TestChatService:
             mock_is_safe.assert_called_once_with(
                 "DROP TABLE users", ["users", "orders", "products"]
             )
+
+    def test_get_or_create_conversation_new(self, mock_services):
+        service = ChatService()
+        mock_services["storage"].conversation_exists.return_value = False
+        cid = service._get_or_create_conversation(None)
+        assert cid == "test-conversation-id"
+
+    def test_get_or_create_conversation_existing(self, mock_services):
+        service = ChatService()
+        mock_services["storage"].conversation_exists.return_value = True
+        cid = service._get_or_create_conversation("existing-id")
+        assert cid == "existing-id"
+
+    def test_get_or_create_conversation_error(self, mock_services):
+        service = ChatService()
+        mock_services["storage"].conversation_exists.side_effect = Exception("fail")
+        cid = service._get_or_create_conversation("bad-id")
+        assert cid is None
+
+    def test_get_schema_or_error_success(self, mock_services):
+        service = ChatService()
+        mock_services["handler"].get_schema.return_value = "schema"
+        result = service._get_schema_or_error("cid")
+        assert result == "schema"
+
+    def test_get_schema_or_error_error(self, mock_services):
+        service = ChatService()
+        mock_services["handler"].get_schema.return_value = "Error: fail"
+        result = service._get_schema_or_error("cid")
+        assert result.startswith("Sorry, I encountered an issue")
+
+    def test_conversation_and_schema_success(self, mock_services):
+        service = ChatService()
+        mock_services["storage"].conversation_exists.return_value = True
+        mock_services["handler"].get_schema.return_value = "schema"
+        cid, schema, error = service._conversation_and_schema("query", "cid")
+        assert cid == "cid"
+        assert schema == "schema"
+        assert error is None
+
+    def test_conversation_and_schema_error(self, mock_services):
+        service = ChatService()
+        mock_services["storage"].conversation_exists.return_value = True
+        mock_services["handler"].get_schema.return_value = "Error: fail"
+        cid, schema, error = service._conversation_and_schema("query", "cid")
+        assert error is not None
+        assert error["error"] == "schema_error"
+
+
+@pytest.mark.asyncio
+async def test_handle_query_stream_success(mock_services):
+    service = ChatService()
+    with patch.object(
+        service, "_conversation_and_schema", return_value=("cid", "schema", None)
+    ), patch.object(
+        service,
+        "_generate_and_execute_sql",
+        return_value={"sql_query": "SELECT", "raw_result": "result"},
+    ), patch.object(
+        service.llm_adapter,
+        "stream_text",
+        return_value=async_iter(["Hello ", "world!"]),
+    ):
+        results = [msg async for msg in service.handle_query_stream("query")]
+        assert any(m["type"] == "llm_token" for m in results)
+        assert any(m["type"] == "llm_stream_end" for m in results)
+
+
+@pytest.mark.asyncio
+async def test_handle_query_stream_error_streaming(mock_services):
+    service = ChatService()
+    with patch.object(
+        service, "_conversation_and_schema", return_value=("cid", "schema", None)
+    ), patch.object(
+        service,
+        "_generate_and_execute_sql",
+        return_value={"sql_query": "SELECT", "raw_result": "Error: fail"},
+    ), patch.object(
+        service,
+        "_stream_error_explanation",
+        return_value=async_iter(
+            [
+                {"type": "llm_token", "token": "Error", "conversation_id": "cid"},
+                {
+                    "type": "llm_stream_end",
+                    "message": "Error",
+                    "conversation_id": "cid",
+                },
+            ]
+        ),
+    ):
+        results = [msg async for msg in service.handle_query_stream("query")]
+        assert any(m["type"] == "llm_token" for m in results)
+        assert any(m["type"] == "llm_stream_end" for m in results)
+
+
+@pytest.mark.asyncio
+async def test_stream_error_explanation(mock_services):
+    service = ChatService()
+    with patch.object(
+        service.llm_adapter,
+        "stream_text",
+        return_value=async_iter(["E", "r", "r", "o", "r"]),
+    ), patch.object(service, "save_message", return_value=True):
+        chunks = [
+            msg
+            async for msg in service._stream_error_explanation(
+                "q", "sql", "fail", "schema", "cid"
+            )
+        ]
+        assert any(m["type"] == "llm_token" for m in chunks)
+        assert any(m["type"] == "llm_stream_end" for m in chunks)
+
+
+def async_iter(items):
+    async def _aiter():
+        for i in items:
+            yield i
+
+    return _aiter()

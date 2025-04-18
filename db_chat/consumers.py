@@ -55,28 +55,30 @@ class ChatConsumer(AsyncWebsocketConsumer):
             data = json.loads(text_data)
             query = data.get("query")
             conversation_id = data.get("conversation_id")
+            stream = data.get("stream", False)
 
             if not query:
                 await self.send_error("Missing 'query' in message.")
                 return
 
-            await self.send_status(f"Processing query: '{query[:50]}...'")
-
-            try:
-                response_data = await chat_service_handle_query(
-                    user_query=query, conversation_id=conversation_id
-                )
-                await self.send(
-                    text_data=json.dumps({"type": "chat_response", **response_data})
-                )
-
-            except Exception as e:
-                logger.exception(
-                    f"Error during handle_query execution in ChatConsumer: {e}"
-                )
-                await self.send_error(
-                    f"An unexpected error occurred while processing your request."
-                )
+            if stream:
+                await self.handle_streaming_query(query, conversation_id)
+            else:
+                await self.send_status(f"Processing query: '{query[:50]}...'")
+                try:
+                    response_data = await chat_service_handle_query(
+                        user_query=query, conversation_id=conversation_id
+                    )
+                    await self.send(
+                        text_data=json.dumps({"type": "chat_response", **response_data})
+                    )
+                except Exception as e:
+                    logger.exception(
+                        f"Error during handle_query execution in ChatConsumer: {e}"
+                    )
+                    await self.send_error(
+                        f"An unexpected error occurred while processing your request."
+                    )
 
         except json.JSONDecodeError:
             logger.warning("Invalid JSON received in ChatConsumer.")
@@ -95,3 +97,17 @@ class ChatConsumer(AsyncWebsocketConsumer):
     async def send_status(self, message):
         """Helper method to send a status update message back to the client."""
         await self.send(text_data=json.dumps({"type": "status", "message": message}))
+
+    async def handle_streaming_query(self, query, conversation_id):
+        """
+        Handles streaming LLM responses over the websocket.
+        """
+        await self.send_status(f"Streaming response for: '{query[:50]}...'")
+        try:
+            async for chunk in ChatService().handle_query_stream(
+                query, conversation_id
+            ):
+                await self.send(text_data=json.dumps(chunk))
+        except Exception as e:
+            logger.exception(f"Error during streaming query: {e}")
+            await self.send_error(f"Streaming error: {str(e)}")

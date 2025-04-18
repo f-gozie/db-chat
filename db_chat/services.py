@@ -341,113 +341,123 @@ class ChatService:
 
         return messages
 
-    def handle_query(
-        self, user_query: str, conversation_id: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Main entry point for processing a user's natural language query.
-
-        This method orchestrates the entire workflow:
-        1. Manages conversation context (creates a new ID or uses/validates existing one).
-        2. Saves the incoming user query to the conversation history.
-        3. Retrieves the database schema for the allowed tables.
-        4. Calls `_generate_and_execute_sql` to get the LLM to produce and validate SQL,
-           and then execute it.
-        5. Based on the outcome of step 4:
-           - If successful execution: Calls `_interpret_sql_results` to get the LLM
-             to explain the results in natural language.
-           - If SQL execution failed: Calls `handle_sql_error` to get the LLM to
-             explain the database error.
-           - If SQL generation/validation failed: Returns the error message directly.
-        6. Returns a dictionary containing the final user-facing reply and other relevant
-           details (conversation ID, SQL query, raw result, error code).
-
-        Args:
-            user_query (str): The natural language query submitted by the user.
-            conversation_id (Optional[str]): The ID of the conversation to continue.
-                If None, a new conversation is created. Defaults to None.
-
-        Returns:
-            Dict[str, Any]: A dictionary summarizing the outcome, including:
-                - 'reply' (str): The final natural language response for the user.
-                - 'conversation_id' (str): The ID of the conversation (new or existing).
-                - 'sql_query' (Optional[str]): The SQL query generated and executed, if any.
-                - 'raw_result' (Optional[Any]): The raw data returned by the query, if executed.
-                - 'error' (Optional[str]): A short code indicating the type of error encountered,
-                    if any (e.g., 'schema_error', 'invalid_structure', 'security_violation',
-                    'sql_execution_error', 'interpretation_exception').
-        """
-        logger.info(
-            f"Handling user query: '{user_query[:50]}...' in conversation: {conversation_id}"
-        )
-
+    def _get_or_create_conversation(
+        self, conversation_id: Optional[str]
+    ) -> Optional[str]:
         if conversation_id is None:
             try:
-                conversation_id = self.create_conversation()
+                return self.create_conversation()
             except Exception:
-                return {
-                    "reply": "Sorry, I couldn't start a new conversation due to a system error.",
-                    "conversation_id": None,
-                    "error": "conversation_creation_error",
-                }
-        else:
-            try:
-                if not self.conversation_storage.conversation_exists(conversation_id):
-                    logger.warning(
-                        f"Conversation ID {conversation_id} not found. Starting a new one."
-                    )
-                    conversation_id = self.create_conversation()
-                else:
-                    self.conversation_storage.update_expiry(conversation_id)
-                    logger.info(f"Using existing conversation: {conversation_id}")
-            except Exception as e:
-                logger.exception(f"Error managing conversation {conversation_id}: {e}")
+                return None
+        try:
+            if not self.conversation_storage.conversation_exists(conversation_id):
+                conversation_id = self.create_conversation()
+            else:
+                self.conversation_storage.update_expiry(conversation_id)
+        except Exception:
+            return None
+        return conversation_id
 
-        self.save_message(conversation_id, "user", user_query)
-
+    def _get_schema_or_error(self, conversation_id: str) -> Optional[str]:
         schema = self.get_db_schema()
         if isinstance(schema, str) and schema.startswith("Error:"):
             error_message = f"Sorry, I encountered an issue accessing the database structure needed to answer your question. {schema}"
             self.save_message(conversation_id, "assistant", error_message)
-            return {
-                "reply": error_message,
+            return error_message
+        return schema
+
+    async def _stream_error_explanation(
+        self, user_query, executed_sql, raw_db_result, schema, conversation_id
+    ):
+        error_context_messages = self._build_messages_for_llm(conversation_id)
+        system_prompt = prompts.get_error_system_prompt()
+        user_prompt = prompts.get_error_user_prompt(executed_sql, raw_db_result)
+        messages_for_llm = error_context_messages + [
+            {"role": "user", "content": user_prompt}
+        ]
+        full_message = ""
+        try:
+            async for chunk in self.llm_adapter.stream_text(
+                system_prompt, messages_for_llm
+            ):
+                full_message += chunk
+                yield {
+                    "type": "llm_token",
+                    "token": chunk,
+                    "conversation_id": conversation_id,
+                }
+            yield {
+                "type": "llm_stream_end",
+                "message": full_message,
                 "conversation_id": conversation_id,
-                "error": "schema_error",
+            }
+            self.save_message(conversation_id, "assistant", full_message)
+        except Exception as e:
+            yield {
+                "type": "error",
+                "message": f"Streaming error: {str(e)}",
+                "conversation_id": conversation_id,
             }
 
-        sql_result = self._generate_and_execute_sql(user_query, schema, conversation_id)
-
-        if "error" in sql_result and "reply" in sql_result:
-            logger.warning(
-                f"SQL generation/validation failed with error: {sql_result.get('error')}"
+    def _conversation_and_schema(self, user_query, conversation_id):
+        conversation_id = self._get_or_create_conversation(conversation_id)
+        if conversation_id is None:
+            return (
+                None,
+                None,
+                {
+                    "reply": "Sorry, I couldn't start a new conversation due to a system error.",
+                    "conversation_id": None,
+                    "error": "conversation_creation_error",
+                },
             )
-            return sql_result
+        self.save_message(conversation_id, "user", user_query)
+        schema = self._get_schema_or_error(conversation_id)
+        if isinstance(schema, str) and schema.startswith(
+            "Sorry, I encountered an issue"
+        ):
+            return (
+                conversation_id,
+                None,
+                {
+                    "reply": schema,
+                    "conversation_id": conversation_id,
+                    "error": "schema_error",
+                },
+            )
+        return conversation_id, schema, None
 
+    def handle_query(
+        self, user_query: str, conversation_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        conversation_id, schema, error = self._conversation_and_schema(
+            user_query, conversation_id
+        )
+        if error:
+            return error
+        sql_result = self._generate_and_execute_sql(user_query, schema, conversation_id)
+        if "error" in sql_result and "reply" in sql_result:
+            return sql_result
         if "sql_query" in sql_result and "raw_result" in sql_result:
             raw_db_result = sql_result["raw_result"]
             executed_sql = sql_result["sql_query"]
-
             if isinstance(raw_db_result, str) and raw_db_result.startswith("Error:"):
-                logger.info(f"SQL execution resulted in an error: {raw_db_result}")
                 return self.handle_sql_error(
                     user_query, executed_sql, raw_db_result, conversation_id
                 )
             else:
-                logger.info("SQL executed successfully, proceeding to interpretation.")
                 return self._interpret_sql_results(
                     user_query, executed_sql, raw_db_result, schema, conversation_id
                 )
-        else:
-            logger.error(
-                "Internal inconsistency: _generate_and_execute_sql finished without error but missing expected keys."
-            )
-            fallback_error = "Sorry, an unexpected internal error occurred while processing your query."
-            self.save_message(conversation_id, "assistant", fallback_error)
-            return {
-                "reply": fallback_error,
-                "conversation_id": conversation_id,
-                "error": "internal_processing_error",
-            }
+        fallback_error = (
+            "Sorry, an unexpected internal error occurred while processing your query."
+        )
+        self.save_message(conversation_id, "assistant", fallback_error)
+        return {
+            "reply": fallback_error,
+            "conversation_id": conversation_id,
+            "error": "internal_processing_error",
+        }
 
     def _generate_and_execute_sql(
         self, user_query: str, schema: str, conversation_id: str
@@ -752,3 +762,75 @@ class ChatService:
                 "conversation_id": conversation_id,
                 "error": "error_explanation_exception",
             }
+
+    async def handle_query_stream(
+        self, user_query: str, conversation_id: Optional[str] = None
+    ):
+        conversation_id, schema, error = self._conversation_and_schema(
+            user_query, conversation_id
+        )
+        if error:
+            yield {
+                "type": "error",
+                "message": error["reply"],
+                "conversation_id": error["conversation_id"],
+            }
+            return
+        sql_result = self._generate_and_execute_sql(user_query, schema, conversation_id)
+        if "error" in sql_result and "reply" in sql_result:
+            yield {
+                "type": "error",
+                "message": sql_result["reply"],
+                "conversation_id": conversation_id,
+            }
+            return
+        if "sql_query" in sql_result and "raw_result" in sql_result:
+            raw_db_result = sql_result["raw_result"]
+            executed_sql = sql_result["sql_query"]
+            if isinstance(raw_db_result, str) and raw_db_result.startswith("Error:"):
+                async for chunk in self._stream_error_explanation(
+                    user_query, executed_sql, raw_db_result, schema, conversation_id
+                ):
+                    yield chunk
+                return
+            interpretation_messages = self._build_messages_for_llm(conversation_id)
+            system_prompt = prompts.get_interpretation_system_prompt(schema, user_query)
+            user_prompt = prompts.get_interpretation_user_prompt(
+                user_query, executed_sql, str(raw_db_result)
+            )
+            messages_for_llm = interpretation_messages + [
+                {"role": "user", "content": user_prompt}
+            ]
+            full_message = ""
+            try:
+                async for chunk in self.llm_adapter.stream_text(
+                    system_prompt, messages_for_llm
+                ):
+                    full_message += chunk
+                    yield {
+                        "type": "llm_token",
+                        "token": chunk,
+                        "conversation_id": conversation_id,
+                    }
+                yield {
+                    "type": "llm_stream_end",
+                    "message": full_message,
+                    "conversation_id": conversation_id,
+                }
+                self.save_message(conversation_id, "assistant", full_message)
+            except Exception as e:
+                yield {
+                    "type": "error",
+                    "message": f"Streaming error: {str(e)}",
+                    "conversation_id": conversation_id,
+                }
+                return
+        else:
+            fallback_error = "Sorry, an unexpected internal error occurred while processing your query."
+            self.save_message(conversation_id, "assistant", fallback_error)
+            yield {
+                "type": "error",
+                "message": fallback_error,
+                "conversation_id": conversation_id,
+            }
+            return

@@ -31,6 +31,13 @@ class LLMAdapter(ABC):
         """
         pass
 
+    @abstractmethod
+    async def stream_text(
+        self, system_prompt: str, messages: List[Dict[str, str]], max_tokens: int = 1024
+    ):
+        """Async generator that yields text chunks from the LLM as they become available."""
+        pass
+
     @classmethod
     def get_adapter(cls) -> "LLMAdapter":
         """Factory method to get the appropriate LLM adapter based on settings.
@@ -112,6 +119,19 @@ class AnthropicAdapter(LLMAdapter):
             logger.error(f"Error generating text with LangChain Anthropic: {e}")
             raise
 
+    async def stream_text(
+        self, system_prompt: str, messages: List[Dict[str, str]], max_tokens: int = 1024
+    ):
+        """Async generator that yields text chunks from Anthropic via LangChain."""
+        lc_messages = self._convert_messages(system_prompt, messages)
+        try:
+            async for chunk in self.client.astream(lc_messages, max_tokens=max_tokens):
+                if hasattr(chunk, "content"):
+                    yield chunk.content
+        except Exception as e:
+            logger.error(f"Error streaming text with LangChain Anthropic: {e}")
+            raise
+
 
 class OpenAIAdapter(LLMAdapter):
     """Adapter for OpenAI models using LangChain."""
@@ -178,4 +198,17 @@ class OpenAIAdapter(LLMAdapter):
                 return str(response.content).strip()
         except Exception as e:
             logger.error(f"Error generating text with LangChain OpenAI: {e}")
+            raise
+
+    async def stream_text(
+        self, system_prompt: str, messages: List[Dict[str, str]], max_tokens: int = 1024
+    ):
+        """Async generator that yields text chunks from OpenAI via LangChain."""
+        lc_messages = self._convert_messages(system_prompt, messages)
+        try:
+            async for chunk in self.client.astream(lc_messages, max_tokens=max_tokens):
+                if hasattr(chunk, "content"):
+                    yield chunk.content
+        except Exception as e:
+            logger.error(f"Error streaming text with LangChain OpenAI: {e}")
             raise
