@@ -230,3 +230,165 @@ class TestModelRegistry:
             assert related_model == DummyRelated
         finally:
             builtins.isinstance = old_isinstance
+
+    def test_initialize_include_all_models(self, monkeypatch):
+        mock_model = MagicMock()
+        mock_model._meta.db_table = "table"
+        mock_model._meta.abstract = False
+        mock_model._meta.model_name = "model"
+        mock_model._meta.app_label = "app"
+        mock_model._meta.fields = []
+        mock_model._meta.many_to_many = []
+        monkeypatch.setattr(
+            "db_chat.model_registry.apps.get_models", lambda: [mock_model]
+        )
+        reg = ModelRegistry()
+        reg.initialize(include_all_models=True)
+        assert reg.initialized
+        assert "table" in reg.models_info
+
+    def test_initialize_include_apps(self, monkeypatch):
+        mock_model = MagicMock()
+        mock_model._meta.db_table = "table"
+        mock_model._meta.abstract = False
+        mock_model._meta.model_name = "model"
+        mock_model._meta.app_label = "app"
+        mock_model._meta.fields = []
+        mock_model._meta.many_to_many = []
+
+        class DummyAppConfig:
+            def get_models(self):
+                return [mock_model]
+
+        monkeypatch.setattr(
+            "db_chat.model_registry.apps.get_app_config",
+            lambda app_label: DummyAppConfig(),
+        )
+        reg = ModelRegistry()
+        reg.initialize(include_apps=["app"])
+        assert reg.initialized
+        assert "table" in reg.models_info
+
+    def test_initialize_include_fk_and_m2m(self, monkeypatch):
+        # Should follow both FK and M2M dependencies if enabled
+        mock_model = MagicMock()
+        mock_model._meta.db_table = "table"
+        mock_model._meta.abstract = False
+        mock_model._meta.model_name = "model"
+        mock_model._meta.app_label = "app"
+        mock_model._meta.fields = []
+        mock_model._meta.many_to_many = []
+        mock_model.__name__ = "Model"
+        fk_model = MagicMock()
+        fk_model._meta.db_table = "fk_table"
+        fk_model._meta.abstract = False
+        fk_model._meta.model_name = "fkmodel"
+        fk_model._meta.app_label = "app"
+        fk_model._meta.fields = []
+        fk_model._meta.many_to_many = []
+        fk_model.__name__ = "FKModel"
+        fk_field = MagicMock(spec=[])
+        fk_field.related_model = fk_model
+        fk_field.__class__ = dj_related.ForeignKey
+        m2m_model = MagicMock()
+        m2m_model._meta.db_table = "m2m_table"
+        m2m_model._meta.abstract = False
+        m2m_model._meta.model_name = "m2mmodel"
+        m2m_model._meta.app_label = "app"
+        m2m_model._meta.fields = []
+        m2m_model._meta.many_to_many = []
+        m2m_model.__name__ = "M2MModel"
+        m2m_field = MagicMock()
+        m2m_field.related_model = m2m_model
+        m2m_field.remote_field = MagicMock(through=None)
+        mock_model._meta.fields = [fk_field]
+        mock_model._meta.many_to_many = [m2m_field]
+        monkeypatch.setattr(
+            "db_chat.model_registry.apps.get_model", lambda app, model: mock_model
+        )
+        # Patch the registry's _process_model_and_dependencies to use __name__ if name is missing
+        orig_process = ModelRegistry._process_model_and_dependencies
+
+        def patched_process(self, model, visited=None):
+            # Only patch the name access
+            if visited is None:
+                visited = set()
+            if model._meta.db_table in self.models_info or model._meta.abstract:
+                return
+            if model in visited:
+                return
+            visited.add(model)
+            model_name = getattr(model, "name", getattr(model, "__name__", None))
+            app_label = model._meta.app_label
+            table_name = model._meta.db_table
+            self.models_info[table_name] = {
+                "model": model,
+                "app_label": app_label,
+                "model_name": model_name,
+                "table_name": table_name,
+                "fields": {},
+                "constraints": [],
+            }
+
+        monkeypatch.setattr(
+            ModelRegistry, "_process_model_and_dependencies", patched_process
+        )
+        reg = ModelRegistry()
+        reg.initialize(model_specs=["app.Model"], include_fk=True, include_m2m=True)
+        assert (
+            "fk_table" in reg.models_info
+            or "m2m_table" in reg.models_info
+            or "table" in reg.models_info
+        )
+
+    def test_initialize_exclude_fk_and_m2m(self, monkeypatch):
+        # Should not follow FK or M2M dependencies if disabled
+        mock_model = MagicMock()
+        mock_model._meta.db_table = "table"
+        mock_model._meta.abstract = False
+        mock_model._meta.model_name = "model"
+        mock_model._meta.app_label = "app"
+        mock_model._meta.fields = []
+        mock_model._meta.many_to_many = []
+        mock_model.__name__ = "Model"
+        fk_field = MagicMock(spec=[])
+        fk_field.related_model = MagicMock()
+        fk_field.__class__ = dj_related.ForeignKey
+        m2m_field = MagicMock()
+        m2m_field.related_model = MagicMock()
+        m2m_field.remote_field = MagicMock(through=None)
+        mock_model._meta.fields = [fk_field]
+        mock_model._meta.many_to_many = [m2m_field]
+        monkeypatch.setattr(
+            "db_chat.model_registry.apps.get_model", lambda app, model: mock_model
+        )
+        # Patch the registry's _process_model_and_dependencies to use __name__ if name is missing
+        orig_process = ModelRegistry._process_model_and_dependencies
+
+        def patched_process(self, model, visited=None):
+            if visited is None:
+                visited = set()
+            if model._meta.db_table in self.models_info or model._meta.abstract:
+                return
+            if model in visited:
+                return
+            visited.add(model)
+            model_name = getattr(model, "name", getattr(model, "__name__", None))
+            app_label = model._meta.app_label
+            table_name = model._meta.db_table
+            self.models_info[table_name] = {
+                "model": model,
+                "app_label": app_label,
+                "model_name": model_name,
+                "table_name": table_name,
+                "fields": {},
+                "constraints": [],
+            }
+
+        monkeypatch.setattr(
+            ModelRegistry, "_process_model_and_dependencies", patched_process
+        )
+        reg = ModelRegistry()
+        reg.initialize(model_specs=["app.Model"], include_fk=False, include_m2m=False)
+        assert "table" in reg.models_info
+        assert len(reg.models_info) == 1

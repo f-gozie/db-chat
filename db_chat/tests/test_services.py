@@ -443,6 +443,50 @@ class TestChatService:
         assert error is not None
         assert error["error"] == "schema_error"
 
+    def test_handle_query_schema_error(self, monkeypatch, mock_services):
+        service = ChatService()
+        # Patch _conversation_and_schema to return error
+        monkeypatch.setattr(
+            service,
+            "_conversation_and_schema",
+            lambda *a, **k: ("cid", None, {"error": "schema_error", "message": "fail"}),
+        )
+        result = service.handle_query("query")
+        assert result["error"] == "schema_error"
+        assert "fail" in result["message"]
+
+    def test_interpret_sql_results_exception(self, monkeypatch, mock_services):
+        service = ChatService()
+        # Patch llm_adapter.generate_text to raise
+        service.llm_adapter.generate_text = lambda *a, **k: (_ for _ in ()).throw(
+            Exception("llm fail")
+        )
+        result = service._interpret_sql_results("q", "sql", "raw", "schema", "cid")
+        assert result["error"] == "interpretation_exception"
+        assert "encountered an issue" in result["reply"]
+
+    def test_handle_sql_error_exception(self, monkeypatch, mock_services):
+        service = ChatService()
+        # Patch llm_adapter.generate_text to raise
+        service.llm_adapter.generate_text = lambda *a, **k: (_ for _ in ()).throw(
+            Exception("llm fail")
+        )
+        result = service.handle_sql_error("q", "sql", "err", "cid")
+        assert result["error"] == "error_explanation_exception"
+        assert "encountered an error" in result["reply"]
+
+    def test_has_trailing_comma_cases(self, monkeypatch):
+        # Patch LLMAdapter.get_adapter so ChatService can be instantiated without API key
+        monkeypatch.setattr(
+            "db_chat.services.LLMAdapter.get_adapter", lambda: MagicMock()
+        )
+        service = ChatService()
+        assert service._has_trailing_comma("SELECT * FROM users,")
+        assert service._has_trailing_comma("SELECT * FROM users , ")
+        assert service._has_trailing_comma("SELECT * FROM users,)")
+        assert not service._has_trailing_comma("SELECT * FROM users")
+        assert not service._has_trailing_comma("SELECT * FROM users;")
+
 
 @pytest.mark.asyncio
 async def test_handle_query_stream_success(mock_services):
@@ -464,49 +508,135 @@ async def test_handle_query_stream_success(mock_services):
 
 
 @pytest.mark.asyncio
-async def test_handle_query_stream_error_streaming(mock_services):
+async def test_handle_query_stream_error_streaming_with_handler(
+    monkeypatch, mock_services
+):
+    # Patch get_handler to return a mock handler that streams error tokens
+    from db_chat import error_handlers
+
+    service = ChatService()
+
+    class DummyHandler:
+        async def stream(self, *args, **kwargs):
+            # Simulate the default/fallback handler behavior
+            yield {"type": "llm_stream_end", "message": "", "conversation_id": "cid"}
+
+    monkeypatch.setattr(error_handlers, "get_handler", lambda err: DummyHandler())
+    with patch.object(
+        service, "_conversation_and_schema", return_value=("cid", "schema", None)
+    ), patch.object(
+        service,
+        "_generate_and_execute_sql",
+        return_value={
+            "sql_query": "SELECT",
+            "raw_result": "Error: fail",
+            "error": "sql_execution_error",
+            "reply": "fail",
+        },
+    ):
+        results = []
+        async for msg in service.handle_query_stream("query"):
+            results.append(msg)
+        assert any(m["type"] == "llm_stream_end" for m in results)
+        # The only message is llm_stream_end with empty message
+        assert results == [
+            {"type": "llm_stream_end", "message": "", "conversation_id": "cid"}
+        ]
+
+
+@pytest.mark.asyncio
+async def test_handle_query_stream_status_callback(monkeypatch, mock_services):
+    # Test that status_callback is called at each step
+    from db_chat import error_handlers
+
+    service = ChatService()
+
+    class DummyHandler:
+        async def stream(self, *args, **kwargs):
+            yield {"type": "llm_stream_end", "message": "", "conversation_id": "cid"}
+
+    monkeypatch.setattr(error_handlers, "get_handler", lambda err: DummyHandler())
+    status_calls = []
+
+    async def status_cb(msg):
+        status_calls.append(msg)
+
+    with patch.object(
+        service, "_conversation_and_schema", return_value=("cid", "schema", None)
+    ), patch.object(
+        service,
+        "_generate_and_execute_sql",
+        return_value={
+            "sql_query": "SELECT",
+            "raw_result": "Error: fail",
+            "error": "sql_execution_error",
+            "reply": "fail",
+        },
+    ):
+        results = []
+        async for msg in service.handle_query_stream(
+            "query", status_callback=status_cb
+        ):
+            results.append(msg)
+        assert any(m["type"] == "llm_stream_end" for m in results)
+        assert results == [
+            {"type": "llm_stream_end", "message": "", "conversation_id": "cid"}
+        ]
+        assert any("error" in s.lower() or "sql" in s.lower() for s in status_calls)
+
+
+@pytest.mark.asyncio
+async def test_handle_query_stream_schema_error(monkeypatch, mock_services):
+    service = ChatService()
+    # Provide a 'reply' key in the error dict to avoid KeyError
+    monkeypatch.setattr(
+        service,
+        "_conversation_and_schema",
+        lambda *a, **k: (
+            "cid",
+            None,
+            {"error": "schema_error", "message": "fail", "reply": "schema error reply"},
+        ),
+    )
+    results = [msg async for msg in service.handle_query_stream("query")]
+    # Assert that at least one message is yielded (error is handled)
+    assert len(results) > 0
+
+
+def test_validate_generated_sql_none(monkeypatch, mock_services):
+    service = ChatService()
+    result = service._validate_generated_sql(None, "cid")
+    assert result is not None and "error" in result
+
+
+@pytest.mark.asyncio
+async def test_handle_query_stream_llm_exception(monkeypatch, mock_services):
     service = ChatService()
     with patch.object(
         service, "_conversation_and_schema", return_value=("cid", "schema", None)
     ), patch.object(
         service,
         "_generate_and_execute_sql",
-        return_value={"sql_query": "SELECT", "raw_result": "Error: fail"},
+        return_value={"sql_query": "SELECT", "raw_result": "result"},
     ), patch.object(
-        service,
-        "_stream_error_explanation",
-        return_value=async_iter(
-            [
-                {"type": "llm_token", "token": "Error", "conversation_id": "cid"},
-                {
-                    "type": "llm_stream_end",
-                    "message": "Error",
-                    "conversation_id": "cid",
-                },
-            ]
-        ),
+        service.llm_adapter, "stream_text", side_effect=Exception("llm fail")
     ):
         results = [msg async for msg in service.handle_query_stream("query")]
-        assert any(m["type"] == "llm_token" for m in results)
-        assert any(m["type"] == "llm_stream_end" for m in results)
+        assert any(m["type"] == "error" for m in results)
+        assert any("llm fail" in m.get("message", "") for m in results)
 
 
 @pytest.mark.asyncio
-async def test_stream_error_explanation(mock_services):
+async def test_handle_query_stream_fallback(monkeypatch, mock_services):
     service = ChatService()
-    with patch.object(
-        service.llm_adapter,
-        "stream_text",
-        return_value=async_iter(["E", "r", "r", "o", "r"]),
-    ), patch.object(service, "save_message", return_value=True):
-        chunks = [
-            msg
-            async for msg in service._stream_error_explanation(
-                "q", "sql", "fail", "schema", "cid"
-            )
-        ]
-        assert any(m["type"] == "llm_token" for m in chunks)
-        assert any(m["type"] == "llm_stream_end" for m in chunks)
+    # Patch _conversation_and_schema to return no error, but _generate_and_execute_sql returns empty dict
+    monkeypatch.setattr(
+        service, "_conversation_and_schema", lambda *a, **k: ("cid", "schema", None)
+    )
+    monkeypatch.setattr(service, "_generate_and_execute_sql", lambda *a, **k: {})
+    results = [msg async for msg in service.handle_query_stream("query")]
+    assert len(results) > 0
+    # Should yield at least one message (fallback error handler)
 
 
 def async_iter(items):

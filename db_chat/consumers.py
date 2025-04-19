@@ -35,7 +35,6 @@ class ChatConsumer(AsyncWebsocketConsumer):
         # TODO: Add authentication/authorization logic if needed
 
         await self.accept()
-        await self.send_status("Connection established. Waiting for query...")
 
     async def disconnect(self, close_code):
         """
@@ -100,12 +99,15 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
     async def handle_streaming_query(self, query, conversation_id):
         """
-        Handles streaming LLM responses over the websocket.
+        Handles streaming LLM responses over the websocket, sending status updates for each backend step.
         """
-        await self.send_status(f"Streaming response for: '{query[:50]}...'")
+
+        async def status_callback(message):
+            await self.send_status(message)
+
         try:
             async for chunk in ChatService().handle_query_stream(
-                query, conversation_id
+                query, conversation_id, status_callback=status_callback
             ):
                 await self.send(text_data=json.dumps(chunk))
         except Exception as e:

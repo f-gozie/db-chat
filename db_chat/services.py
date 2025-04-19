@@ -11,6 +11,7 @@ from . import prompts
 from .connectors.postgres.pg_connector import PgConnector
 from .connectors.postgres.pg_handler import PgHandler
 from .constants import DatabaseDialects
+from .error_handlers import get_handler
 from .llm_adapter import LLMAdapter
 from .model_registry import get_registry
 from .storage import ConversationStorage, get_conversation_storage
@@ -366,40 +367,11 @@ class ChatService:
             return error_message
         return schema
 
-    async def _stream_error_explanation(
-        self, user_query, executed_sql, raw_db_result, schema, conversation_id
-    ):
-        error_context_messages = self._build_messages_for_llm(conversation_id)
-        system_prompt = prompts.get_error_system_prompt()
-        user_prompt = prompts.get_error_user_prompt(executed_sql, raw_db_result)
-        messages_for_llm = error_context_messages + [
-            {"role": "user", "content": user_prompt}
-        ]
-        full_message = ""
-        try:
-            async for chunk in self.llm_adapter.stream_text(
-                system_prompt, messages_for_llm
-            ):
-                full_message += chunk
-                yield {
-                    "type": "llm_token",
-                    "token": chunk,
-                    "conversation_id": conversation_id,
-                }
-            yield {
-                "type": "llm_stream_end",
-                "message": full_message,
-                "conversation_id": conversation_id,
-            }
-            self.save_message(conversation_id, "assistant", full_message)
-        except Exception as e:
-            yield {
-                "type": "error",
-                "message": f"Streaming error: {str(e)}",
-                "conversation_id": conversation_id,
-            }
-
     def _conversation_and_schema(self, user_query, conversation_id):
+        """
+        Ensure a conversation exists, save the user query, and fetch schema or return a schema error.
+        Returns a tuple (conversation_id, schema, error_dict).
+        """
         conversation_id = self._get_or_create_conversation(conversation_id)
         if conversation_id is None:
             return (
@@ -557,15 +529,16 @@ class ChatService:
                                       returning directly from the calling method. Returns None
                                       if the query is valid.
         """
-        if "cannot answer" in sql_query.lower():
-            logger.warning(f"LLM indicated it cannot answer query: {sql_query}")
-            self.save_message(conversation_id, "assistant", sql_query)
+        if not sql_query:
             return {
-                "reply": sql_query,
-                "conversation_id": conversation_id,
-                "error": "cannot_answer",
+                "error": "invalid_structure",
+                "message": "No SQL query was generated.",
             }
-
+        if "cannot answer" in sql_query.lower():
+            return {
+                "error": "cannot_answer",
+                "message": "The system could not generate a SQL query for this question.",
+            }
         if not is_valid_sql_structure(sql_query):
             error_message = "I couldn't generate a query with the correct structure (e.g., must start with SELECT). Please try rephrasing."
             logger.warning(f"Generated SQL failed structure validation: {sql_query}")
@@ -764,35 +737,88 @@ class ChatService:
             }
 
     async def handle_query_stream(
-        self, user_query: str, conversation_id: Optional[str] = None
+        self,
+        user_query: str,
+        conversation_id: Optional[str] = None,
+        status_callback: Optional[Any] = None,
     ):
+        """
+        Streams the response to a user query over a websocket, sending status updates at each backend step.
+        Args:
+            user_query (str): The user's natural language query.
+            conversation_id (Optional[str]): The conversation ID for context.
+            status_callback (Optional[Callable]): Async function to send status updates to the frontend.
+        Yields:
+            dict: Websocket message chunks (llm_token, llm_stream_end, or error).
+        """
+        # Conversation and schema initialization
+        if status_callback:
+            await status_callback("Generating query SQL...")
         conversation_id, schema, error = self._conversation_and_schema(
             user_query, conversation_id
         )
         if error:
-            yield {
-                "type": "error",
-                "message": error["reply"],
-                "conversation_id": error["conversation_id"],
-            }
+            if status_callback:
+                await status_callback("Preparing error response…")
+            err_type = error.get("error", "generic_error")
+            handler = get_handler(err_type)
+            async for chunk in handler.stream(
+                self,
+                user_query,
+                "",
+                error["reply"],
+                schema if schema else "",
+                conversation_id,
+                status_callback=status_callback,
+            ):
+                yield chunk
             return
+        # Generate and execute SQL
+        if status_callback:
+            await status_callback("Validating and executing SQL...")
         sql_result = self._generate_and_execute_sql(user_query, schema, conversation_id)
-        if "error" in sql_result and "reply" in sql_result:
-            yield {
-                "type": "error",
-                "message": sql_result["reply"],
-                "conversation_id": conversation_id,
-            }
+        # Centralised error handling --------------------------------------
+        if "error" in sql_result:
+            error_type = sql_result.get("error", "generic_error")
+            executed_sql = sql_result.get("sql_query", "")
+            error_message = sql_result.get("reply", "Unknown error")
+            handler = get_handler(error_type)
+            async for chunk in handler.stream(
+                self,
+                user_query,
+                executed_sql,
+                error_message,
+                schema,
+                conversation_id,
+                status_callback=status_callback,
+            ):
+                yield chunk
             return
+        # Successful SQL; handle execution errors vs interpretation
         if "sql_query" in sql_result and "raw_result" in sql_result:
             raw_db_result = sql_result["raw_result"]
             executed_sql = sql_result["sql_query"]
             if isinstance(raw_db_result, str) and raw_db_result.startswith("Error:"):
-                async for chunk in self._stream_error_explanation(
-                    user_query, executed_sql, raw_db_result, schema, conversation_id
+                if status_callback:
+                    await status_callback(
+                        "SQL execution error. Converting error to human readable message..."
+                    )
+                handler = get_handler("sql_execution_error")
+                async for chunk in handler.stream(
+                    self,
+                    user_query,
+                    executed_sql,
+                    raw_db_result,
+                    schema,
+                    conversation_id,
+                    status_callback=status_callback,
                 ):
                     yield chunk
                 return
+            if status_callback:
+                await status_callback(
+                    "Converting SQL result to human readable message..."
+                )
             interpretation_messages = self._build_messages_for_llm(conversation_id)
             system_prompt = prompts.get_interpretation_system_prompt(schema, user_query)
             user_prompt = prompts.get_interpretation_user_prompt(
@@ -819,6 +845,10 @@ class ChatService:
                 }
                 self.save_message(conversation_id, "assistant", full_message)
             except Exception as e:
+                if status_callback:
+                    await status_callback(
+                        "Error during streaming of LLM interpretation."
+                    )
                 yield {
                     "type": "error",
                     "message": f"Streaming error: {str(e)}",
@@ -826,11 +856,21 @@ class ChatService:
                 }
                 return
         else:
+            if status_callback:
+                await status_callback(
+                    "Unexpected internal error. Generating error message..."
+                )
             fallback_error = "Sorry, an unexpected internal error occurred while processing your query."
             self.save_message(conversation_id, "assistant", fallback_error)
-            yield {
-                "type": "error",
-                "message": fallback_error,
-                "conversation_id": conversation_id,
-            }
+            handler = get_handler("internal_processing_error")
+            async for chunk in handler.stream(
+                self,
+                user_query,
+                "",
+                fallback_error,
+                schema if schema else "",
+                conversation_id,
+                status_callback=status_callback,
+            ):
+                yield chunk
             return

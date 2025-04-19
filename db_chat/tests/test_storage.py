@@ -48,6 +48,27 @@ class TestInMemoryConversationStorage:
         assert self.storage.update_expiry(cid)
         assert not self.storage.update_expiry("nonexistent")
 
+    def test_conversation_exists_true_false(self, conversation_id):
+        storage = chat_storage.InMemoryConversationStorage()
+        cid = storage.create_conversation()
+        assert storage.conversation_exists(cid)
+        assert not storage.conversation_exists("nonexistent")
+
+    def test_save_message_error(self, monkeypatch, conversation_id):
+        storage = chat_storage.InMemoryConversationStorage()
+        monkeypatch.setattr(storage, "_conversations", None)
+        assert not storage.save_message("cid", {"role": "user", "content": "hi"})
+
+    def test_get_conversation_error(self, monkeypatch, conversation_id):
+        storage = chat_storage.InMemoryConversationStorage()
+        monkeypatch.setattr(storage, "_conversations", None)
+        assert storage.get_conversation("cid") == []
+
+    def test_delete_conversation_error(self, monkeypatch, conversation_id):
+        storage = chat_storage.InMemoryConversationStorage()
+        monkeypatch.setattr(storage, "_conversations", None)
+        assert not storage.delete_conversation("cid")
+
 
 class TestRedisConversationStorage:
     @patch("db_chat.storage.redis.Redis")
@@ -94,3 +115,41 @@ class TestRedisConversationStorage:
         assert storage.update_expiry(cid)
         mock_client.exists.return_value = False
         assert not storage.update_expiry(cid)
+
+    @patch("db_chat.storage.redis.Redis")
+    def test_conversation_exists_true_false(self, mock_redis):
+        mock_client = MagicMock()
+        mock_redis.from_url.return_value = mock_client
+        storage = chat_storage.RedisConversationStorage()
+        storage.redis_client = mock_client
+        mock_client.exists.side_effect = [1, 0]
+        assert storage.conversation_exists("cid")
+        assert not storage.conversation_exists("cid2")
+
+    @patch("db_chat.storage.redis.Redis")
+    def test_save_message_error(self, mock_redis):
+        mock_client = MagicMock()
+        mock_redis.from_url.return_value = mock_client
+        storage = chat_storage.RedisConversationStorage()
+        storage.redis_client = mock_client
+        mock_client.rpush.side_effect = Exception("fail")
+        assert not storage.save_message("cid", {"role": "user", "content": "hi"})
+
+    @patch("db_chat.storage.redis.Redis")
+    def test_get_conversation_error(self, mock_redis):
+        mock_client = MagicMock()
+        mock_redis.from_url.return_value = mock_client
+        storage = chat_storage.RedisConversationStorage()
+        storage.redis_client = mock_client
+        mock_client.lrange.side_effect = Exception("fail")
+        mock_client.exists.return_value = True
+        assert storage.get_conversation("cid") == []
+
+    @patch("db_chat.storage.redis.Redis")
+    def test_delete_conversation_error(self, mock_redis):
+        mock_client = MagicMock()
+        mock_redis.from_url.return_value = mock_client
+        storage = chat_storage.RedisConversationStorage()
+        storage.redis_client = mock_client
+        mock_client.delete.side_effect = Exception("fail")
+        assert not storage.delete_conversation("cid")

@@ -21,7 +21,21 @@ class ModelRegistry:
         self.initialized = False
         self.dependency_graph = defaultdict(set)
 
-    def initialize(self, model_specs=None):
+        # Configuration flags (can be overridden via Django settings or initialize params)
+        self.include_fk = True
+        self.include_m2m = True
+        self.include_all_models = False
+        self.include_apps: List[str] = []
+
+    def initialize(
+        self,
+        model_specs=None,
+        *,
+        include_fk: Optional[bool] = None,
+        include_m2m: Optional[bool] = None,
+        include_all_models: Optional[bool] = None,
+        include_apps: Optional[List[str]] = None,
+    ):
         """Load and process specified models and their dependencies.
 
         Args:
@@ -33,17 +47,72 @@ class ModelRegistry:
 
         logger.info("Initializing model registry...")
 
+        # Merge supplied flags with settings‑based configuration
+        settings_opts = getattr(settings, "MODEL_REGISTRY_OPTIONS", {})
+
+        self.include_fk = (
+            include_fk
+            if include_fk is not None
+            else settings_opts.get("include_fk", True)
+        )
+        self.include_m2m = (
+            include_m2m
+            if include_m2m is not None
+            else settings_opts.get("include_m2m", True)
+        )
+        self.include_all_models = (
+            include_all_models
+            if include_all_models is not None
+            else settings_opts.get("include_all_models", False)
+        )
+        self.include_apps = (
+            include_apps
+            if include_apps is not None
+            else settings_opts.get("include_apps", [])
+        )
+
+        # Decide which models to load:
+        # 1. If include_all_models -> load everything
+        # 2. Else if include_apps -> load all models from specified apps
+        # 3. Else fall back to model_specs (or ALLOWED_MODELS setting)
+
+        if self.include_all_models:
+            all_models = apps.get_models()
+            for m in all_models:
+                self._process_model_and_dependencies(m)
+            self.initialized = True
+            logger.info(
+                f"Model registry initialized (ALL MODELS) with {len(self.models_info)} tables"
+            )
+            return
+
+        if self.include_apps:
+            for app_label in self.include_apps:
+                try:
+                    app_config = apps.get_app_config(app_label)
+                    for m in app_config.get_models():
+                        self._process_model_and_dependencies(m)
+                except LookupError:
+                    logger.warning(f"App '{app_label}' not found in INSTALLED_APPS.")
+
+            # If no explicit model_specs provided, we're done
+            if model_specs is None:
+                self.initialized = True
+                logger.info(
+                    f"Model registry initialized (apps={self.include_apps}) with {len(self.models_info)} tables"
+                )
+                return
+
         # Get model specifications from settings if not provided
         if model_specs is None:
-            # Get from ALLOWED_MODELS setting
             model_specs = getattr(settings, "ALLOWED_MODELS", [])
 
-            if not model_specs:
-                logger.warning(
-                    "No models specified. Configure ALLOWED_MODELS in settings."
-                )
-                self.initialized = True
-                return
+        if not model_specs:
+            logger.warning(
+                "No models specified. Configure ALLOWED_MODELS in settings or use include_all_models/include_apps flags."
+            )
+            self.initialized = True
+            return
 
         # Process each model specification
         for model_spec in model_specs:
@@ -83,20 +152,30 @@ class ModelRegistry:
         logger.debug(f"Processing model {app_label}.{model_name} (table: {table_name})")
 
         # First collect dependencies to build the dependency graph
-        dependencies = []
-        for field in model._meta.fields:
-            if isinstance(field, (related.ForeignKey, related.OneToOneField)):
+        dependencies: List[models.Model] = []
+
+        # Follow ForeignKey / OneToOne relationships
+        if self.include_fk:
+            for field in model._meta.fields:
+                if isinstance(field, (related.ForeignKey, related.OneToOneField)):
+                    related_model = field.related_model
+                    if related_model and not related_model._meta.abstract:
+                        dependencies.append(related_model)
+                        self.dependency_graph[model].add(related_model)
+
+        # Follow Many‑to‑Many relationships (including explicit through tables)
+        if self.include_m2m:
+            for field in model._meta.many_to_many:
                 related_model = field.related_model
                 if related_model and not related_model._meta.abstract:
                     dependencies.append(related_model)
                     self.dependency_graph[model].add(related_model)
 
-        # Also check Many-to-Many fields
-        for field in model._meta.many_to_many:
-            related_model = field.related_model
-            if related_model and not related_model._meta.abstract:
-                dependencies.append(related_model)
-                self.dependency_graph[model].add(related_model)
+                # Include the through/intermediate model for the M2M relation
+                through_model = getattr(field.remote_field, "through", None)
+                if through_model and not through_model._meta.abstract:
+                    dependencies.append(through_model)
+                    self.dependency_graph[model].add(through_model)
 
         # Store model info
         model_info = {
@@ -271,8 +350,13 @@ class ModelRegistry:
 
             choices_str = ""
             if field_info["choices"]:
-                choice_values = [repr(choice[0]) for choice in field_info["choices"]]
-                choices_str = f" CHOICES: ({', '.join(choice_values)})"
+                # Build CHOICES with both value and display label for clarity
+                choice_items = []
+                for val, name in field_info["choices"]:
+                    val_repr = repr(val)
+                    name_repr = repr(name)
+                    choice_items.append(f"{val_repr}: {name_repr}")
+                choices_str = f" CHOICES: ({', '.join(choice_items)})"
 
             field_def = f"  - {field_name} ({db_column_name}): {field_type}{json_info} {constraints_str}{choices_str}"
             schema_lines.append(field_def)

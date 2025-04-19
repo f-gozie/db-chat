@@ -18,40 +18,44 @@ def clean_sql_query(text):
 
 
 def is_valid_sql_structure(text):
-    """Check if text has the basic structure of a SQL query using sqlparse."""
-    parsed = sqlparse.parse(text)
-    if not parsed or not parsed[0].tokens:
-        return False
-    stmt = parsed[0]
-    # Must start with SELECT
-    first_token = next((t for t in stmt.tokens if not t.is_whitespace), None)
-    if not first_token or not (
-        first_token.ttype is DML and first_token.value.upper() == "SELECT"
-    ):
-        return False
-    # Must contain FROM after SELECT
-    found_select = False
-    found_from = False
-    found_table_after_from = False
-    for idx, token in enumerate(stmt.tokens):
-        if token.ttype is DML and token.value.upper() == "SELECT":
-            found_select = True
-        if found_select and token.ttype is Keyword and token.value.upper() == "FROM":
-            found_from = True
-            # Check if there's something after FROM
-            next_meaningful_token = next(
-                (t for t in stmt.tokens[idx + 1 :] if not t.is_whitespace), None
-            )
-            if next_meaningful_token:
-                found_table_after_from = True
-            break
-    if not (found_select and found_from and found_table_after_from):
-        return False
-    # Parentheses must be balanced
+    """Check if text has the basic structure of a SQL query, including CTEs."""
+    text_stripped = text.strip()
+    text_upper = text_stripped.upper()
+
+    # Basic checks: balanced parentheses and no double commas
     if text.count("(") != text.count(")"):
         return False
-    # No double commas
-    if ",," in text or re.search(r"\s,\s,", text):
+    if ",," in text:
+        return False
+
+    # Helper to check non-empty table after FROM/JOIN
+    def has_table_after_from(query: str) -> bool:
+        match = re.search(r"\bFROM\s+([a-zA-Z0-9_]+)", query, re.IGNORECASE)
+        return bool(match and match.group(1).strip())
+
+    # Handle CTEs starting with WITH
+    if text_upper.startswith("WITH"):
+        # Extract main query after CTE block
+        try:
+            last_paren = text_stripped.rfind(")")
+            main_query = text_stripped[last_paren + 1 :].lstrip(" ;")
+        except Exception:
+            return False
+
+        if not main_query.upper().startswith("SELECT"):
+            return False
+        if "FROM" not in main_query.upper():
+            return False
+        if not has_table_after_from(main_query):
+            return False
+        return True
+
+    # Regular queries: must start with SELECT and contain FROM
+    if not text_upper.startswith("SELECT"):
+        return False
+    if "FROM" not in text_upper:
+        return False
+    if not has_table_after_from(text_stripped):
         return False
     return True
 
@@ -96,6 +100,12 @@ def extract_table_names_with_sqlparse(sql):
                                     # Recursively extract tables from nested statements
                                     for table in extract_tables_from_token(subtoken):
                                         tables.add(table)
+
+    # Fallback: simple regex to catch tables missed by sqlparse (e.g., deeply nested CTEs)
+    # This is not perfect SQL parsing but provides a safety net for common cases.
+    regex_tables = re.findall(r"\b(?:from|join)\s+([a-zA-Z0-9_]+)", sql, re.IGNORECASE)
+    for tbl in regex_tables:
+        tables.add(tbl)
     return tables
 
 
@@ -152,21 +162,52 @@ def is_safe_sql(text, allowed_tables):
         logger.warning(f"SQL contains write operations: {text}")
         return False
 
+    allowed_tables_lower = [t.lower() for t in allowed_tables]
+
     cte_names = []
+    cte_definitions: dict[str, str] = {}
     if re.search(r"\bwith\b", lowered, re.IGNORECASE):
-        cte_matches = re.findall(r"(\w+)\s+as\s*\(", lowered, re.IGNORECASE)
-        cte_names = [cte.lower() for cte in cte_matches]
-        logger.info(f"Found CTEs in query: {cte_names}")
+        # Capture CTE names and their definition body for validation
+        cte_pattern = re.compile(
+            r"(\w+)\s+as\s*\((.*?)\)\s*(,|with|select|$)", re.IGNORECASE | re.DOTALL
+        )
+        for match in cte_pattern.finditer(text):
+            cte_name = match.group(1).lower()
+            cte_body = match.group(2)
+            cte_names.append(cte_name)
+            cte_definitions[cte_name] = cte_body
+        if cte_names:
+            logger.info(f"Found CTEs in query: {cte_names}")
 
     mentioned_tables = extract_table_names_with_sqlparse(text)
     if "with" in lowered:
-        # Find all FROM ... patterns in the query
+        # Find all FROM ... patterns in the query (outside of CTE definitions)
         all_from_tables = re.findall(r"\bfrom\s+(\w+)", lowered)
         for table in all_from_tables:
-            if table.lower() not in cte_names:
-                mentioned_tables.add(table)
+            mentioned_tables.add(table)
 
-    allowed_tables_lower = [t.lower() for t in allowed_tables]
+        # Validate each CTE definition references only allowed tables
+        for cte_name, body in cte_definitions.items():
+            inner_tables = extract_table_names_with_sqlparse(body)
+            # If CTE body references disallowed tables OR references no tables at all, mark unsafe
+            if not inner_tables:
+                # Allow empty body if the CTE name itself is an allowed table (e.g., renaming)
+                if cte_name not in allowed_tables_lower:
+                    logger.warning(
+                        f"CTE '{cte_name}' does not reference any tables – flagging as unsafe."
+                    )
+                    return False
+            for t in inner_tables:
+                if t.lower() not in allowed_tables_lower and t.lower() not in cte_names:
+                    logger.warning(
+                        f"CTE '{cte_name}' references disallowed table '{t}'."
+                    )
+                    return False
+
+    # Remove obvious column names captured from EXTRACT / expressions
+    blacklist = {"year", "month", "day", "created", "updated"}
+    mentioned_tables = {t for t in mentioned_tables if t.lower() not in blacklist}
+
     for table in mentioned_tables:
         if table.lower() not in allowed_tables_lower and table.lower() not in cte_names:
             logger.warning(f"SQL references non-allowed table: {table}")

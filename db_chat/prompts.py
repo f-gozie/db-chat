@@ -145,3 +145,44 @@ But the query failed with this error:
 {error_message}
 
 Please explain the error in simple terms and suggest how I might rephrase my question to get a successful answer. Be brief and helpful, avoiding technical jargon when possible."""
+
+
+def get_user_friendly_error_prompt(user_query, error_type, error_message):
+    """
+    Return a user-centric, context-aware error prompt for the LLM to explain errors in relation to the user's question.
+
+    Args:
+        user_query: The user's original question
+        error_type: A string categorizing the error (e.g., 'invalid_structure', 'security_violation', etc.)
+        error_message: The backend/system error message (not shown directly to the user)
+
+    Returns:
+        str: A prompt for the LLM to generate a user-friendly error explanation
+    """
+    base = f"""A user asked the following question:
+"{user_query}"
+
+Unfortunately, I couldn't provide a direct answer because of the following issue:
+"""
+    if error_type == "invalid_structure":
+        base += "It looks like the question couldn't be translated into a valid database query. Please try to be more specific or ask about a particular table, field, or value."
+    elif error_type == "security_violation":
+        base += "The question requested information or actions that aren't allowed for security or privacy reasons. Please focus your question on the available data or tables."
+    elif error_type == "cannot_answer":
+        base += "The information needed to answer this question isn't available in the current database. Please try rephrasing or asking about something else."
+    elif error_type == "trailing_comma":
+        base += "There was a technical issue with the generated query. Please try rephrasing your question in a different way."
+    elif error_type == "schema_error":
+        base += "There was a problem accessing the database structure needed to answer your question. Please try again later or contact support if the issue persists."
+    elif error_type == "conversation_creation_error":
+        base += "There was a problem starting a new conversation. Please try again or refresh the page."
+    elif error_type == "generation_execution_exception":
+        base += "An unexpected error occurred while preparing to answer your question. Please try again or rephrase your question."
+    elif error_type == "internal_processing_error":
+        base += "An unexpected internal error occurred. Please try again or rephrase your question."
+    else:
+        base += (
+            "An error occurred. Please try rephrasing your question or try again later."
+        )
+    base += "\n\nIf possible, suggest a way the user could rephrase their question to get a better answer. Be friendly, concise, and avoid technical jargon."
+    return base

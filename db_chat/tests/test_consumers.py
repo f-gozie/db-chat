@@ -19,9 +19,7 @@ async def test_connect_when_enabled():
 
     await consumer.connect()
     consumer.accept.assert_called_once()
-    consumer.send_status.assert_called_once_with(
-        "Connection established. Waiting for query..."
-    )
+    # No status message is sent on connect anymore
 
 
 @pytest.mark.asyncio
