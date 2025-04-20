@@ -15,3 +15,21 @@ langchain-openai>=0.3.14
 langchain-anthropic>=0.3.12
 
 sqlparse
+
+# Optional for RAG / Advanced Features
+numpy>=1.20
+sentence-transformers>=2.2
+torch>=1.8
+tiktoken>=0.4
+
+# Testing
+pytest==8.*
+pytest-asyncio==0.*
+freezegun==1.*
+
+# Added from the code block
+asgiref==3.*
+channels==4.*
+Django==5.*
+djangorestframework==3.*
+python-dotenv==1.*

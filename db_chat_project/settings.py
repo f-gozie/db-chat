@@ -152,3 +152,12 @@ CONVERSATION_TTL_SECONDS = int(
 # Maximum number of previous messages to include in conversation context
 # Default: 10 messages
 CONVERSATION_CONTEXT_LIMIT = int(os.environ.get("CONVERSATION_CONTEXT_LIMIT", 10))
+
+
+DB_CHAT = {
+    "CLARIFICATION_ENABLED": True,
+    "SUMMARIZATION_ENABLED": True,
+    "POST_PROCESSOR_ENABLED": True,
+    "ENABLE_SCHEMA_CACHING": True,
+    "SCHEMA_CACHE_TTL": 300,
+}

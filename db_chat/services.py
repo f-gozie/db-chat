@@ -1,23 +1,77 @@
 """Core service for the database chat application."""
 
+import asyncio
 import logging
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from asgiref.sync import sync_to_async
 from django.conf import settings
 
 from . import prompts
 from .connectors.postgres.pg_connector import PgConnector
 from .connectors.postgres.pg_handler import PgHandler
 from .constants import DatabaseDialects
+from .embeddings import BaseEmbeddingModel, get_embedding_model
 from .error_handlers import get_handler
 from .llm_adapter import LLMAdapter
 from .model_registry import get_registry
-from .storage import ConversationStorage, get_conversation_storage
+from .storage import (
+    BaseVectorStorage,
+    ConversationStorage,
+    get_conversation_storage,
+    get_vector_storage,
+)
 from .utils import clean_sql_query, is_safe_sql, is_valid_sql_structure
 
+try:
+    import tiktoken
+
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+
+# --- Token Counting Helper ---
+
+
+def _estimate_token_count(
+    messages: List[Dict[str, str]], model_name: str = "gpt-4"
+) -> int:
+    """Estimate token count for a list of messages using tiktoken."""
+    if not TIKTOKEN_AVAILABLE:
+        # Fallback: estimate based on character count (very rough)
+        total_chars = sum(len(msg.get("content", "")) for msg in messages)
+        return total_chars // 4  # Rough approximation: 1 token ~= 4 chars
+
+    try:
+        # Attempt to get encoding for the specific model, fallback to cl100k_base
+        try:
+            encoding = tiktoken.encoding_for_model(model_name)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+        num_tokens = 0
+        for message in messages:
+            # Standard token counting logic for chat models
+            num_tokens += (
+                4  # Every message follows <|start|>{role/name}\n{content}<|end|>\n
+            )
+            for key, value in message.items():
+                num_tokens += len(encoding.encode(str(value)))
+                if key == "name":  # If there's a name, the role is omitted
+                    num_tokens -= 1  # Role is always required and always 1 token
+        num_tokens += 2  # Every reply is primed with <|start|>assistant
+        return num_tokens
+    except Exception as e:
+        logger.warning(
+            f"Tiktoken estimation failed for model {model_name}: {e}. Falling back to char count."
+        )
+        total_chars = sum(len(msg.get("content", "")) for msg in messages)
+        return total_chars // 4
 
 
 class ChatService:
@@ -52,6 +106,13 @@ class ChatService:
         context_limit (int): The maximum number of past messages to include in the
             context provided to the LLM.
         db_dialect (str): The database dialect (e.g., "PostgreSQL").
+        summarization_enabled (bool): Whether summarization is enabled.
+        summarization_trigger (int): The trigger for summarization.
+        vector_storage (BaseVectorStorage): Instance for storing vectors.
+        embedding_model (BaseEmbeddingModel): Instance for generating embeddings.
+        rag_enabled (bool): Whether RAG is enabled.
+        rag_k (int): The number of relevant messages to retrieve.
+        rag_m_recent (int): The number of recent messages to include.
     """
 
     db_connector: PgConnector
@@ -61,6 +122,13 @@ class ChatService:
     allowed_tables: List[str]
     context_limit: int
     db_dialect: str
+    summarization_enabled: bool
+    summarization_trigger: int
+    vector_storage: BaseVectorStorage
+    embedding_model: BaseEmbeddingModel
+    rag_enabled: bool
+    rag_k: int
+    rag_m_recent: int
 
     def __init__(self):
         """Initializes the ChatService by setting up all its dependent components.
@@ -73,6 +141,27 @@ class ChatService:
         self._initialize_model_registry()
         self._initialize_llm_adapter()
         self._initialize_conversation_storage()
+        # Config flags
+        cfg = getattr(settings, "DB_CHAT", {}) or {}
+        self.summarization_enabled = cfg.get("SUMMARIZATION_ENABLED", True)
+        self.summarization_trigger = cfg.get("SUMMARIZATION_TRIGGER", 12)
+        self.rag_enabled = cfg.get("RAG_ENABLED", False)
+        self.rag_k = cfg.get("RAG_K", 3)
+        self.rag_m_recent = cfg.get("RAG_M_RECENT", 2)
+
+        # Initialize RAG components if enabled
+        if self.rag_enabled:
+            self.vector_storage = get_vector_storage()
+            self.embedding_model = get_embedding_model()
+            logger.info(
+                "RAG enabled. Using Vector Store: %s, Embedding Model: %s",
+                self.vector_storage.__class__.__name__,
+                self.embedding_model.__class__.__name__,
+            )
+        else:
+            self.vector_storage = None
+            self.embedding_model = None
+
         logger.info("ChatService initialized successfully.")
 
     def _initialize_db_components(self):
@@ -286,6 +375,28 @@ class ChatService:
                 logger.error(
                     f"Failed to save message to conversation {conversation_id}"
                 )
+            # If RAG is enabled, also upsert vector asynchronously
+            if (
+                success
+                and self.rag_enabled
+                and self.vector_storage
+                and self.embedding_model
+            ):
+                # Only embed non-system messages with content
+                if role != "system" and content:
+                    try:
+                        vector = self.embedding_model.embed(content)
+                        # Use sync_to_async if vector_storage is not async-native
+                        upsert_async = sync_to_async(
+                            self.vector_storage.upsert_message, thread_sensitive=False
+                        )
+                        asyncio.create_task(
+                            upsert_async(conversation_id, message, vector)
+                        )
+                    except Exception as vector_exc:
+                        logger.exception(
+                            "Failed to embed or upsert message vector: %s", vector_exc
+                        )
             return success
         except Exception as e:
             logger.exception(
@@ -297,50 +408,133 @@ class ChatService:
         self, conversation_id: str, current_user_query: Optional[str] = None
     ) -> List[Dict[str, str]]:
         """
-        Constructs the list of messages to be sent to the LLM for context.
-
-        Retrieves historical messages for the given conversation ID from the storage
-        backend, limited by `self.context_limit`. It filters out any messages with
-        the role 'system' (which might contain raw SQL/results not meant for direct
-        LLM context in the next turn) and formats the remaining messages (user/assistant)
-        into the standard dictionary format expected by the LLM adapter.
-        Optionally appends the `current_user_query` as the latest user message.
-
-        Args:
-            conversation_id (str): The ID of the conversation whose history is needed.
-            current_user_query (Optional[str]): The most recent query from the user, to be
-                appended to the history as the last message. Defaults to None.
-
-        Returns:
-            List[Dict[str, str]]: A list of message dictionaries, ordered chronologically,
-                                  ready to be passed to the LLM adapter.
-                                  Returns an empty list if history retrieval fails.
+        Constructs messages for LLM, using RAG if enabled, falling back to window/summary.
         """
         try:
-            history = self.conversation_storage.get_conversation(
-                conversation_id, limit=self.context_limit
-            )
+            if (
+                self.rag_enabled
+                and self.vector_storage
+                and self.embedding_model
+                and current_user_query
+            ):
+                # RAG Path
+                logger.debug(
+                    "Building context using RAG (k=%d, m=%d)",
+                    self.rag_k,
+                    self.rag_m_recent,
+                )
+
+                # 1. Get most recent M messages (for short-term memory/flow)
+                recent_history = self.conversation_storage.get_conversation(
+                    conversation_id, limit=self.rag_m_recent
+                )
+
+                # 2. Get top K relevant messages from vector store
+                query_vector = self.embedding_model.embed(current_user_query)
+                relevant_history = self.vector_storage.search_relevant(
+                    conversation_id, query_vector, k=self.rag_k
+                )
+
+                # 3. Combine and deduplicate
+                combined_history = []
+                seen_timestamps = set()
+                # Add relevant first, then recent, ensuring uniqueness by timestamp
+                for msg in relevant_history + recent_history:
+                    ts = msg.get("timestamp")
+                    if ts and ts not in seen_timestamps:
+                        combined_history.append(msg)
+                        seen_timestamps.add(ts)
+
+                # Sort combined by timestamp
+                combined_history.sort(key=lambda x: x.get("timestamp", ""))
+
+                # Filter out system messages and format for LLM
+                messages = [
+                    {"role": msg["role"], "content": msg["content"]}
+                    for msg in combined_history
+                    if msg.get("role") != "system"
+                ]
+
+            else:
+                # Fallback: Window + Summarization Path (Phase 2 logic)
+                logger.debug("Building context using Sliding Window / Summarization")
+                history = self.conversation_storage.get_conversation(conversation_id)
+
+                if (
+                    self.summarization_enabled
+                    and len(history) > self.summarization_trigger
+                ):
+                    # (Existing Summarization logic from Phase 2 - keep as is)
+                    summary_already_present = any(
+                        m.get("role") == "system" and m.get("meta") == "summary"
+                        for m in history
+                    )
+                    if not summary_already_present:
+                        older_msgs = history[: -self.context_limit]
+                        older_text = "\n".join(
+                            f"{m['role']}: {m['content']}"
+                            for m in older_msgs
+                            if m.get("content")
+                        )[:4000]
+                        try:
+                            summary_prompt = (
+                                "Summarize the following conversation between a user and a database assistant in 2‑3 sentences. "
+                                "Focus on the key facts, user intents, and any conclusions drawn.\n\n"
+                                + older_text
+                            )
+                            summary_text = self.llm_adapter.generate_text(
+                                "You are a helpful assistant that creates concise summaries.",
+                                [{"role": "user", "content": summary_prompt}],
+                            ).strip()
+                            self.conversation_storage.save_message(
+                                conversation_id,
+                                {
+                                    "role": "system",
+                                    "content": summary_text,
+                                    "meta": "summary",
+                                },
+                            )
+                            history = self.conversation_storage.get_conversation(
+                                conversation_id, limit=self.context_limit + 1
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to generate or save summary; falling back to trim."
+                            )
+                            history = history[-self.context_limit :]
+                    else:
+                        # If summary already present, just trim to context window + summary
+                        summary_item = [
+                            m for m in history if m.get("meta") == "summary"
+                        ]
+                        recent_items = history[-self.context_limit :]
+                        history = summary_item + recent_items
+                else:
+                    # If no summarization needed yet, just limit by context_limit
+                    history = history[-self.context_limit :]
+
+                # Format for LLM, filtering system messages
+                messages = [
+                    {"role": msg["role"], "content": msg["content"]}
+                    for msg in history
+                    if msg.get("role") != "system"
+                ]
+
+            # Append the current user query *after* history processing
+            if current_user_query:
+                messages.append({"role": "user", "content": current_user_query})
+
+            return messages
+
         except Exception as e:
             logger.exception(
-                f"Error retrieving conversation history for {conversation_id}: {e}"
+                f"Error building messages for LLM for {conversation_id}: {e}"
             )
-            history = []
-
-        messages = []
-        for msg in history:
-            if msg.get("role") != "system":
-                content = msg.get("content", "")
-                if not isinstance(content, str):
-                    logger.warning(
-                        f"Non-string content found in message history for {conversation_id}, converting."
-                    )
-                    content = str(content)
-                messages.append({"role": msg["role"], "content": content})
-
-        if current_user_query:
-            messages.append({"role": "user", "content": current_user_query})
-
-        return messages
+            # Fallback to just the current query if history fails
+            messages = []
+            if current_user_query:
+                messages.append({"role": "user", "content": current_user_query})
+            return messages
 
     def _get_or_create_conversation(
         self, conversation_id: Optional[str]
@@ -467,6 +661,17 @@ class ChatService:
             messages_for_llm = conversation_messages + [
                 {"role": "user", "content": user_prompt}
             ]
+
+            # Estimate and log token count before sending
+            try:
+                # Try to get actual model name from adapter if available
+                llm_model_name = getattr(self.llm_adapter, "model_name", "gpt-4")
+                token_estimate = _estimate_token_count(messages_for_llm, llm_model_name)
+                logger.info(
+                    f"Estimated token count for generate_text: {token_estimate}"
+                )
+            except Exception:
+                logger.warning("Could not estimate token count.")
 
             logger.info("Generating SQL query via LLM...")
             generated_text = self.llm_adapter.generate_text(
@@ -643,6 +848,16 @@ class ChatService:
                 {"role": "user", "content": user_prompt}
             ]
 
+            # Estimate and log token count before sending
+            try:
+                llm_model_name = getattr(self.llm_adapter, "model_name", "gpt-4")
+                token_estimate = _estimate_token_count(messages_for_llm, llm_model_name)
+                logger.info(
+                    f"Estimated token count for interpretation: {token_estimate}"
+                )
+            except Exception:
+                logger.warning("Could not estimate token count for interpretation.")
+
             logger.info("Interpreting SQL results via LLM...")
             nl_response = self.llm_adapter.generate_text(
                 system_prompt, messages_for_llm
@@ -707,6 +922,16 @@ class ChatService:
             messages_for_llm = error_context_messages + [
                 {"role": "user", "content": user_prompt}
             ]
+
+            # Estimate and log token count before sending
+            try:
+                llm_model_name = getattr(self.llm_adapter, "model_name", "gpt-4")
+                token_estimate = _estimate_token_count(messages_for_llm, llm_model_name)
+                logger.info(
+                    f"Estimated token count for error explanation: {token_estimate}"
+                )
+            except Exception:
+                logger.warning("Could not estimate token count for error explanation.")
 
             logger.info("Generating friendly SQL error explanation via LLM...")
             friendly_error = self.llm_adapter.generate_text(
@@ -827,6 +1052,17 @@ class ChatService:
             messages_for_llm = interpretation_messages + [
                 {"role": "user", "content": user_prompt}
             ]
+
+            # Estimate and log token count before streaming
+            try:
+                llm_model_name = getattr(self.llm_adapter, "model_name", "gpt-4")
+                token_estimate = _estimate_token_count(messages_for_llm, llm_model_name)
+                logger.info(
+                    f"Estimated token count for stream_text (interpretation): {token_estimate}"
+                )
+            except Exception:
+                logger.warning("Could not estimate token count for stream_text.")
+
             full_message = ""
             try:
                 async for chunk in self.llm_adapter.stream_text(

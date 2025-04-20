@@ -21,6 +21,11 @@ dependencies = [
     "langchain-openai",
     "langchain-anthropic",
     "sqlparse",
+    "numpy",
+    "scikit-learn",
+    "torch",
+    "sentence-transformers",
+    "tiktoken",
 ]
 classifiers = [
     "Environment :: Web Environment",

@@ -6,7 +6,7 @@ import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 try:
     import redis
@@ -371,3 +371,124 @@ def get_conversation_storage() -> ConversationStorage:
             f"Unknown storage type '{storage_type}', falling back to in-memory storage"
         )
         return InMemoryConversationStorage()
+
+
+# == Vector Storage ==
+
+
+class BaseVectorStorage(ABC):
+    """Abstract base class for storing and retrieving message embeddings."""
+
+    @abstractmethod
+    def upsert_message(
+        self, conversation_id: str, message: Dict[str, Any], vector: List[float]
+    ):
+        """Store a message along with its embedding vector."""
+        pass
+
+    @abstractmethod
+    def search_relevant(
+        self, conversation_id: str, query_vector: List[float], k: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Find the top k messages most similar to the query vector."""
+        pass
+
+    @abstractmethod
+    def delete_conversation_vectors(self, conversation_id: str):
+        """Remove all vectors associated with a conversation."""
+        pass
+
+
+class InMemoryVectorStorage(BaseVectorStorage):
+    """Simple in-memory vector storage using cosine similarity.
+
+    Note: Requires `numpy` for calculations. Install with `pip install numpy`.
+    This is suitable for development or small-scale use only.
+    """
+
+    _storage: Dict[str, List[Tuple[Dict[str, Any], List[float]]]] = {}
+    _numpy_available = False
+
+    def __init__(self):
+        try:
+            import numpy as np
+
+            self._np = np
+            self._numpy_available = True
+        except ImportError:
+            logger.warning(
+                "NumPy not found. InMemoryVectorStorage similarity search will be basic. "
+                "Install with 'pip install numpy'."
+            )
+
+    def upsert_message(
+        self, conversation_id: str, message: Dict[str, Any], vector: List[float]
+    ):
+        if conversation_id not in self._storage:
+            self._storage[conversation_id] = []
+        self._storage[conversation_id].append((message, vector))
+
+    def search_relevant(
+        self, conversation_id: str, query_vector: List[float], k: int = 3
+    ) -> List[Dict[str, Any]]:
+        if not self._numpy_available or conversation_id not in self._storage:
+            return []
+
+        conv_history = self._storage[conversation_id]
+        if not conv_history:
+            return []
+
+        # Calculate cosine similarity
+        query_vec = self._np.array(query_vector)
+        message_vecs = self._np.array([item[1] for item in conv_history])
+
+        # Handle potential zero vectors
+        query_norm = self._np.linalg.norm(query_vec)
+        message_norms = self._np.linalg.norm(message_vecs, axis=1)
+
+        if query_norm == 0:
+            return []
+
+        # Avoid division by zero for message vectors
+        valid_indices = message_norms > 0
+        if not self._np.any(valid_indices):
+            return []
+
+        similarities = self._np.dot(message_vecs[valid_indices], query_vec) / (
+            message_norms[valid_indices] * query_norm
+        )
+
+        # Get indices of top k similarities
+        valid_history = [
+            conv_history[i] for i, valid in enumerate(valid_indices) if valid
+        ]
+        k = min(k, len(similarities))
+        top_k_indices = self._np.argsort(similarities)[-k:][::-1]
+
+        return [valid_history[i][0] for i in top_k_indices]
+
+    def delete_conversation_vectors(self, conversation_id: str):
+        if conversation_id in self._storage:
+            del self._storage[conversation_id]
+
+
+# Factory function for vector storage
+@lru_cache(maxsize=1)
+def get_vector_storage() -> BaseVectorStorage:
+    from django.conf import settings
+
+    from .components import import_from_dotted_path  # Reuse helper
+
+    config = getattr(settings, "DB_CHAT", {}) or {}
+    storage_path = config.get(
+        "VECTOR_STORAGE_CLASS", "db_chat.storage.InMemoryVectorStorage"
+    )
+    try:
+        storage_class = import_from_dotted_path(storage_path)
+        instance = storage_class()
+        logger.info(f"Using vector storage: {storage_class.__name__}")
+        return instance
+    except Exception as e:
+        logger.exception(f"Failed to load vector storage '{storage_path}': {e}")
+        logger.warning("Falling back to InMemoryVectorStorage for vectors.")
+        return InMemoryVectorStorage()
